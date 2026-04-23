@@ -1,0 +1,20 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    cron \
+    python3 \
+    curl \
+    bc \
+    ent \
+    rng-tools5 \
+    dieharder \
+    ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY audit/run_audit.py /app/run_audit.py
+COPY audit/entrypoint.sh /app/entrypoint.sh
+
+RUN chmod +x /app/entrypoint.sh
+
+CMD ["/app/entrypoint.sh"]

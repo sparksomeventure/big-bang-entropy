@@ -1,0 +1,97 @@
+services:
+  generator:
+    build:
+      context: .
+      dockerfile: Dockerfile.generator
+    container_name: entropy-generator
+    restart: unless-stopped
+    ports:
+      - "5005:5005/udp"
+    environment:
+      - HTTP_PORT=8080
+      - TELNET_PORT=1420
+      - UDP_PORT=5005
+      - POOL_SIZE_MB=128
+      - RAW_HTTP_CHUNK=65536
+      - TELNET_SESSION_BYTES=65536
+      - TELNET_MAX_BYTES_PER_SESSION=1048576
+      - STREAM_CHUNK_BYTES=65536
+      - STREAM_WAIT_TIMEOUT_SEC=2.0
+      - STREAM_WAIT_INTERVAL_SEC=0.05
+      - WATERFALL_HISTORY_FRAMES=5
+      - MIX_BLOCK_BYTES=64
+      - LOW_POOL_THRESHOLD_PCT=10
+      - THROTTLE_BYTES_PER_SEC=1048576
+      - LOG_EVERY_SEC=30
+    networks:
+      - entropy-net
+
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    container_name: entropy-nginx
+    restart: unless-stopped
+    depends_on:
+      - generator
+    ports:
+      - "8080:80"
+      - "1420:1420"
+    networks:
+      - entropy-net
+
+  audit:
+    build:
+      context: .
+      dockerfile: Dockerfile.audit
+    container_name: entropy-audit
+    restart: unless-stopped
+    depends_on:
+      - generator
+    environment:
+      - TZ=UTC
+      - AUDIT_TARGET_HOST=generator
+      - AUDIT_TARGET_TCP_PORT=1420
+      - AUDIT_TARGET_HTTP_URL=http://generator:8080
+      - AUDIT_SAMPLE_SIZE=${AUDIT_SAMPLE_SIZE:-20971520}
+      - AUDIT_RNGTEST_BLOCKS=${AUDIT_RNGTEST_BLOCKS:-1000}
+      - AUDIT_DIEHARDER_TESTS=${AUDIT_DIEHARDER_TESTS:-0}
+      - AUDIT_SHA512_ROUNDS=${AUDIT_SHA512_ROUNDS:-32}
+      - AUDIT_CRON=${AUDIT_CRON:-17 5 * * 6}
+      - AUDIT_CHAIN_SECRET=${AUDIT_CHAIN_SECRET:-}
+      - AUDIT_RUN_ON_START=${AUDIT_RUN_ON_START:-0}
+    volumes:
+      - audit-reports:/reports
+    networks:
+      - entropy-net
+
+  sdr-node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.sdr
+    container_name: entropy-sdr-node-1
+    restart: unless-stopped
+    depends_on:
+      - generator
+    environment:
+      - PLUTO_IP=${PLUTO_IP:-192.168.2.1}
+      - FREQ=${FREQ:-1420405000}
+      - GAIN=${GAIN:-45}
+      - NODE_NAME=${NODE_NAME:-sdr-node-1}
+      - UDP_TARGET_HOST=generator
+      - UDP_TARGET_PORT=5005
+      - SAMPLE_PACKET_BYTES=12000
+      - WATERFALL_INTERVAL_SEC=10
+      - WATERFALL_UDP_CHUNK_BYTES=48000
+      - WATERFALL_HISTORY_FRAMES=5
+      - WATERFALL_AXIS_WINDOW_SEC=30
+      - LOG_EVERY_SEC=30
+    networks:
+      - entropy-net
+
+networks:
+  entropy-net:
+    driver: bridge
+
+volumes:
+  audit-reports:

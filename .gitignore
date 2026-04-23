@@ -1,0 +1,7 @@
+.env
+*.bin
+*.log
+__pycache__/
+.DS_Store
+certbot/
+nginx/conf.d/*.conf
