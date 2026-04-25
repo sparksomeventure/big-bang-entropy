@@ -151,7 +151,25 @@ def entropy_sender_worker():
             valid_mask = pairs[:, 0] != pairs[:, 1]
             extracted_bits = pairs[valid_mask, 0]
 
-            # 5. Pack bits into bytes and accumulate
+            # 5. FIPS 140-3 Health Checks (RCT & APT)
+            # RCT: Repetition Count Test (checks for stuck bits / constant output)
+            if len(extracted_bits) > 32:
+                # Check for long runs of the same bit
+                bit_str = "".join(extracted_bits.astype(str))
+                if "0" * 32 in bit_str or "1" * 32 in bit_str:
+                    log("[!] Health Check Failed: RCT (long run detected). Dropping packet.")
+                    continue
+
+            # APT: Adaptive Proportion Test (checks for strong bias in a window)
+            # Window of 512 bits, max 400 of the same bit (conservative)
+            if len(extracted_bits) >= 512:
+                window = extracted_bits[:512]
+                ones = np.sum(window)
+                if ones < 112 or ones > 400: # Approx 0.22 to 0.78 proportion
+                    log(f"[!] Health Check Failed: APT (bias detected: {ones}/512 ones). Dropping packet.")
+                    continue
+
+            # 6. Pack bits into bytes and accumulate
             extracted_bytes = np.packbits(extracted_bits).tobytes()
             entropy_accumulator.extend(extracted_bytes)
             # ------------------------------------------------------------------

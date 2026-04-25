@@ -25,6 +25,7 @@ POOL_SIZE_MB = int(os.getenv("POOL_SIZE_MB", "128"))
 POOL_MAX_BYTES = POOL_SIZE_MB * 1024 * 1024
 IMAGE_ASSEMBLY_TTL_SEC = int(os.getenv("IMAGE_ASSEMBLY_TTL_SEC", "60"))
 WATERFALL_HISTORY_FRAMES = int(os.getenv("WATERFALL_HISTORY_FRAMES", "5"))
+NODE_TTL_SEC = int(os.getenv("NODE_TTL_SEC", str(6 * 60 * 60)))
 MIX_BLOCK_BYTES = int(os.getenv("MIX_BLOCK_BYTES", "64"))
 LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
 LOW_POOL_THRESHOLD_PCT = float(os.getenv("LOW_POOL_THRESHOLD_PCT", "10"))
@@ -217,7 +218,31 @@ def _update_node_stats(node_name: str, raw_bytes: int, payload_bytes: int):
         state["last_seen"] = time.time()
 
 
+def _cleanup_stale_nodes(now: Optional[float] = None):
+    now = time.time() if now is None else now
+    cutoff = now - NODE_TTL_SEC
+
+    with node_stats_lock:
+        stale_nodes = [
+            node_name
+            for node_name, state in node_stats.items()
+            if state["last_seen"] and state["last_seen"] < cutoff
+        ]
+        for node_name in stale_nodes:
+            del node_stats[node_name]
+
+    with waterfalls_lock:
+        stale_waterfalls = [
+            node_name
+            for node_name, state in waterfalls.items()
+            if state["updated_at"] < cutoff
+        ]
+        for node_name in stale_waterfalls:
+            del waterfalls[node_name]
+
+
 def _snapshot_sources():
+    _cleanup_stale_nodes()
     now = time.time()
     with node_stats_lock:
         payload = []
@@ -274,6 +299,7 @@ def cleanup_incomplete_images_worker():
             ]
             for message_id in stale_keys:
                 del image_fragments[message_id]
+        _cleanup_stale_nodes()
         time.sleep(5)
 
 
@@ -475,6 +501,7 @@ app.wsgi_app = ProxyFix(
 
 @app.route("/healthz")
 def healthz():
+    _cleanup_stale_nodes()
     with pool_lock:
         pool_bytes = len(entropy_pool)
     with waterfalls_lock:
@@ -534,6 +561,7 @@ def download_entropy():
 
 @app.route("/waterfalls")
 def list_waterfalls():
+    _cleanup_stale_nodes()
     with waterfalls_lock:
         payload = [
             {
@@ -563,6 +591,7 @@ def list_sources():
 
 @app.route("/waterfall")
 def get_default_waterfall():
+    _cleanup_stale_nodes()
     node_name = request.args.get("node")
     if not node_name:
         with waterfalls_lock:
@@ -574,6 +603,7 @@ def get_default_waterfall():
 
 @app.route("/waterfall/<node_name>.<ext>")
 def get_waterfall(node_name: str, ext: str):
+    _cleanup_stale_nodes()
     if ext not in ("png", "webp"):
         return "Invalid extension", 400
 
@@ -716,6 +746,7 @@ def api_lotto():
 def stats_logger_worker():
     while True:
         time.sleep(LOG_EVERY_SEC)
+        _cleanup_stale_nodes()
 
         with pool_lock:
             pool_bytes = len(entropy_pool)
