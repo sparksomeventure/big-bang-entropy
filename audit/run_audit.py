@@ -200,26 +200,26 @@ def get_system_snapshot():
 def build_verdict(entropy_bits, rng_successes, rng_failures, dieharder_lines):
     if entropy_bits is None:
         return {
-            "label": "BŁĄD_AUDYTU",
-            "summary": "Nie udało się policzyć podstawowych statystyk ENT.",
+            "label": "AUDIT_ERROR",
+            "summary": "The basic ENT statistics could not be calculated.",
         }
 
     dieharder_failed = any("FAILED" in line for line in dieharder_lines)
     if entropy_bits > 7.999 and rng_successes == RNGTEST_BLOCKS and not dieharder_failed:
         return {
-            "label": "KRYPTOGRAFICZNIE_BARDZO_MOCNA",
-            "summary": "Próbka przeszła szybkie testy statystyczne i nie pokazuje oczywistych czerwonych flag.",
+            "label": "CRYPTOGRAPHICALLY_VERY_STRONG",
+            "summary": "The sample passed the quick statistical checks and shows no obvious red flags.",
         }
 
     if entropy_bits > 7.99 and (rng_failures in (0, None)) and not dieharder_failed:
         return {
-            "label": "DOBRA",
-            "summary": "Jakość wygląda dobrze, ale warto dalej obserwować wyniki tygodniowe i trendy środowiskowe.",
+            "label": "GOOD",
+            "summary": "Quality looks good, but weekly results and environmental trends should still be monitored.",
         }
 
     return {
-        "label": "WYMAGA_UWAGI",
-        "summary": "Wynik nie wygląda alarmująco automatycznie, ale potrzebuje ręcznego sprawdzenia parametrów źródła i próbkowania.",
+        "label": "NEEDS_ATTENTION",
+        "summary": "The result is not automatically alarming, but it needs a manual review of source and sampling parameters.",
     }
 
 
@@ -254,11 +254,11 @@ def write_index(entries):
         )
 
     page = f"""<!doctype html>
-<html lang=\"pl\">
+<html lang=\"en\">
 <head>
   <meta charset=\"utf-8\">
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-  <title>Raporty audytu entropy</title>
+  <title>Entropy audit reports</title>
   <style>
     body {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background:#0a0f14; color:#d7e3f4; margin:0; padding:32px; }}
     h1 {{ margin-top:0; }}
@@ -270,20 +270,20 @@ def write_index(entries):
   </style>
 </head>
 <body>
-  <h1>Raporty audytu kryptograficznego</h1>
-  <p class=\"meta\">Raporty są generowane cyklicznie przez usługę audit. Każdy wpis jest dopisywany do łańcucha integralności w pliku <a href=\"chain.jsonl\">chain.jsonl</a>. Jeśli ustawiono sekret środowiskowy, wpisy zawierają także HMAC.</p>
+  <h1>Cryptographic audit reports</h1>
+  <p class=\"meta\">Reports are generated periodically by the audit service. Each entry is appended to the integrity chain stored in <a href=\"chain.jsonl\">chain.jsonl</a>. If an environment secret is configured, entries also include an HMAC.</p>
   <table>
     <thead>
       <tr>
-        <th>Data</th>
+        <th>Date</th>
         <th>HTML</th>
         <th>JSON</th>
-        <th>Werdykt</th>
+        <th>Verdict</th>
         <th>Chain hash</th>
       </tr>
     </thead>
     <tbody>
-      {''.join(rows) if rows else '<tr><td colspan="5">Brak raportów</td></tr>'}
+      {''.join(rows) if rows else '<tr><td colspan="5">No reports yet</td></tr>'}
     </tbody>
   </table>
 </body>
@@ -305,14 +305,14 @@ def render_report_html(report):
         f"<td>{item['avg_bytes_per_sec']}</td>"
         "</tr>"
         for item in report.get("sources", [])
-    ) or '<tr><td colspan="4">Brak danych o źródłach</td></tr>'
+    ) or '<tr><td colspan="4">No source data available</td></tr>'
 
     return f"""<!doctype html>
-<html lang=\"pl\">
+<html lang=\"en\">
 <head>
   <meta charset=\"utf-8\">
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-  <title>Raport audytu {html.escape(report['timestamp'])}</title>
+  <title>Audit report {html.escape(report['timestamp'])}</title>
   <style>
     body {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background:#081018; color:#dbe8f7; margin:0; padding:32px; line-height:1.55; }}
     h1, h2 {{ color:#ffffff; }}
@@ -326,36 +326,36 @@ def render_report_html(report):
   </style>
 </head>
 <body>
-  <p><a href=\"./index.html\">Powrót do indeksu raportów</a></p>
-  <h1>Raport audytu kryptograficznego</h1>
-  <p class=\"muted\">Data: {html.escape(report['timestamp'])} | Źródło próbek: <code>{html.escape(report['sample']['source'])}</code></p>
+  <p><a href=\"./index.html\">Back to report index</a></p>
+  <h1>Cryptographic audit report</h1>
+  <p class=\"muted\">Date: {html.escape(report['timestamp'])} | Sample source: <code>{html.escape(report['sample']['source'])}</code></p>
 
   <div class=\"grid\">
     <section class=\"card\">
-      <h2>Werdykt</h2>
+      <h2>Verdict</h2>
       <p><code>{html.escape(report['verdict']['label'])}</code></p>
       <p>{html.escape(report['verdict']['summary'])}</p>
     </section>
     <section class=\"card\">
-      <h2>Integralność</h2>
-      <p>Poprzedni hash: <code>{html.escape(str(report['integrity']['prev_chain_hash']))}</code></p>
-      <p>Hash raportu: <code>{html.escape(report['integrity']['report_sha256'])}</code></p>
+      <h2>Integrity</h2>
+      <p>Previous hash: <code>{html.escape(str(report['integrity']['prev_chain_hash']))}</code></p>
+      <p>Report hash: <code>{html.escape(report['integrity']['report_sha256'])}</code></p>
       <p>Chain hash: <code>{html.escape(report['integrity']['chain_hash'])}</code></p>
       <p>HMAC: <code>{html.escape(str(report['integrity'].get('chain_hmac')))}</code></p>
     </section>
     <section class=\"card\">
-      <h2>Wydajność</h2>
-      <p>Pobieranie próbek: <code>{report['sample']['throughput_mib_s']} MiB/s</code></p>
-      <p>Sesje TCP: <code>{report['sample']['sessions']}</code></p>
+      <h2>Performance</h2>
+      <p>Sample download: <code>{report['sample']['throughput_mib_s']} MiB/s</code></p>
+      <p>TCP sessions: <code>{report['sample']['sessions']}</code></p>
       <p>SHA-512: <code>{report['benchmarks']['sha512']['throughput_mib_s']} MiB/s</code></p>
-      <p>Czas ENT / RNG / Dieharder: <code>{report['tests']['ent']['duration_sec']} / {report['tests']['rngtest']['duration_sec']} / {report['tests']['dieharder']['duration_sec']} s</code></p>
+      <p>ENT / RNG / Dieharder time: <code>{report['tests']['ent']['duration_sec']} / {report['tests']['rngtest']['duration_sec']} / {report['tests']['dieharder']['duration_sec']} s</code></p>
     </section>
   </div>
 
-  <h2>Parametry źródła</h2>
+  <h2>Source parameters</h2>
   <pre>{html.escape(json.dumps(report['healthz'], indent=2, ensure_ascii=False))}</pre>
 
-  <h2>Statystyki testów</h2>
+  <h2>Test statistics</h2>
   <div class=\"grid\">
     <section class=\"card\">
       <h2>ENT</h2>
@@ -371,10 +371,10 @@ def render_report_html(report):
     </section>
   </div>
 
-  <h2>Środowisko kontenera audytu</h2>
+  <h2>Audit container environment</h2>
   <pre>{html.escape(json.dumps(report['environment'], indent=2, ensure_ascii=False))}</pre>
 
-  <h2>Nody źródłowe</h2>
+  <h2>Source nodes</h2>
   <table>
     <thead>
       <tr><th>Node</th><th>Packets</th><th>Raw bytes</th><th>Avg B/s</th></tr>
@@ -397,7 +397,7 @@ def main():
 
     sample = fetch_sample_via_tcp(SAMPLE_SIZE)
     if sample["bytes"] <= 0:
-        raise RuntimeError("Nie udało się pobrać próbki z generatora przez TCP 1420.")
+        raise RuntimeError("Failed to fetch a sample from the generator over TCP 1420.")
 
     with tempfile.NamedTemporaryFile(prefix="entropy-audit-", suffix=".bin", delete=False) as tmp:
         tmp.write(sample["data"])

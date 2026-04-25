@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 PLUTO_IP = os.getenv("PLUTO_IP", "192.168.2.1")
 FREQ = int(os.getenv("FREQ", "1420405000"))
 GAIN = int(os.getenv("GAIN", "70"))
+RX_CHANNEL = os.getenv("RX_CHANNEL", "voltage0")
 NODE_NAME = os.getenv("NODE_NAME", socket.gethostname())
 UDP_TARGET_HOST = os.getenv("UDP_TARGET_HOST", "generator")
 UDP_TARGET_PORT = int(os.getenv("UDP_TARGET_PORT", "5005"))
@@ -86,7 +87,7 @@ def build_iio_context():
 def configure_radio(ctx):
     phy = ctx.find_device("ad9361-phy")
     phy.find_channel("altvoltage0", True).attrs["frequency"].value = str(FREQ)
-    rx = phy.find_channel("voltage0")
+    rx = phy.find_channel(RX_CHANNEL)
     rx.attrs["gain_control_mode"].value = "manual"
     rx.attrs["hardwaregain"].value = str(GAIN)
 
@@ -110,7 +111,8 @@ def entropy_sender_worker():
         buffer = iio.Buffer(data_dev, 65536)
         log(
             f"[*] SDR sample stream ready (node={NODE_NAME}, pluto_ip={PLUTO_IP}, "
-            f"freq={FREQ}, gain={GAIN}, sample_packet_bytes={SAMPLE_PACKET_BYTES})"
+            f"freq={FREQ}, gain={GAIN}, rx_channel={RX_CHANNEL}, "
+            f"sample_packet_bytes={SAMPLE_PACKET_BYTES})"
         )
     except Exception as exc:
         log(f"[!] SDR init error: {exc}")
