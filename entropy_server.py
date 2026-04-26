@@ -15,6 +15,7 @@ UDP_HOST = os.getenv("UDP_HOST", "0.0.0.0")
 UDP_PORT = int(os.getenv("UDP_PORT", "5005"))
 HTTP_PORT = int(os.getenv("HTTP_PORT", "8080"))
 TELNET_PORT = int(os.getenv("TELNET_PORT", "1420"))
+RAW_TELNET_PORT = int(os.getenv("RAW_TELNET_PORT", "1421"))
 RAW_HTTP_CHUNK = int(os.getenv("RAW_HTTP_CHUNK", "65536"))
 TELNET_SESSION_BYTES = int(os.getenv("TELNET_SESSION_BYTES", str(RAW_HTTP_CHUNK)))
 TELNET_MAX_BYTES_PER_SESSION = int(os.getenv("TELNET_MAX_BYTES_PER_SESSION", str(1024 * 1024)))
@@ -23,6 +24,8 @@ STREAM_WAIT_TIMEOUT_SEC = float(os.getenv("STREAM_WAIT_TIMEOUT_SEC", "2.0"))
 STREAM_WAIT_INTERVAL_SEC = float(os.getenv("STREAM_WAIT_INTERVAL_SEC", "0.05"))
 POOL_SIZE_MB = int(os.getenv("POOL_SIZE_MB", "128"))
 POOL_MAX_BYTES = POOL_SIZE_MB * 1024 * 1024
+RAW_POOL_SIZE_MB = int(os.getenv("RAW_POOL_SIZE_MB", "64"))
+RAW_POOL_MAX_BYTES = RAW_POOL_SIZE_MB * 1024 * 1024
 IMAGE_ASSEMBLY_TTL_SEC = int(os.getenv("IMAGE_ASSEMBLY_TTL_SEC", "60"))
 WATERFALL_HISTORY_FRAMES = int(os.getenv("WATERFALL_HISTORY_FRAMES", "5"))
 NODE_TTL_SEC = int(os.getenv("NODE_TTL_SEC", str(6 * 60 * 60)))
@@ -49,6 +52,9 @@ AUTOSTART_THREADS = os.getenv("ENTROPY_SERVER_AUTOSTART_THREADS", "1").lower() i
 entropy_pool = bytearray()
 pool_lock = threading.Lock()
 
+raw_pool = bytearray()
+raw_pool_lock = threading.Lock()
+
 waterfalls: Dict[str, Dict[str, object]] = {}
 waterfalls_lock = threading.Lock()
 
@@ -72,6 +78,13 @@ def _clamp_pool():
     if len(entropy_pool) > POOL_MAX_BYTES + margin:
         excess = len(entropy_pool) - POOL_MAX_BYTES
         del entropy_pool[:excess]
+
+def _clamp_raw_pool():
+    global raw_pool
+    margin = 5 * 1024 * 1024
+    if len(raw_pool) > RAW_POOL_MAX_BYTES + margin:
+        excess = len(raw_pool) - RAW_POOL_MAX_BYTES
+        del raw_pool[:excess]
 
 
 def _store_entropy(payload: bytes):
@@ -99,6 +112,15 @@ def _pop_entropy_chunk_up_to(chunk_size: int) -> Optional[bytes]:
         actual_size = min(len(entropy_pool), chunk_size)
         data = bytes(entropy_pool[-actual_size:])
         del entropy_pool[-actual_size:]
+        return data
+
+def _pop_raw_chunk(chunk_size: int) -> Optional[bytes]:
+    global raw_pool
+    with raw_pool_lock:
+        if len(raw_pool) < chunk_size:
+            return None
+        data = bytes(raw_pool[-chunk_size:])
+        del raw_pool[-chunk_size:]
         return data
 
 
@@ -286,6 +308,11 @@ def _mix_samples_into_entropy(node_name: str, raw_samples: bytes, source_timesta
         generator_state = local_state
 
     _store_entropy(processed_output)
+    
+    # Store raw samples for auditing (Stage 2)
+    with raw_pool_lock:
+        raw_pool.extend(raw_samples)
+        _clamp_raw_pool()
 
 
 def cleanup_incomplete_images_worker():
@@ -425,6 +452,25 @@ def telnet_client_worker(conn: socket.socket, address):
             pass
 
 
+def raw_telnet_client_worker(conn: socket.socket, address):
+    try:
+        log(f"[*] TCP RAW client connected from {address}")
+        session_bytes = _effective_telnet_session_bytes()
+        data = _pop_raw_chunk(session_bytes)
+        if data is None:
+            conn.sendall(b"Warming up raw pool...\n")
+            return
+        conn.sendall(data)
+        log(f"[*] TCP RAW client {address} served {len(data)} bytes")
+    except Exception as exc:
+        log(f"[!] TCP RAW client error from {address}: {exc}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def telnet_server_worker():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -436,6 +482,22 @@ def telnet_server_worker():
         conn, address = server.accept()
         threading.Thread(
             target=telnet_client_worker,
+            args=(conn, address),
+            daemon=True,
+        ).start()
+
+
+def raw_telnet_server_worker():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", RAW_TELNET_PORT))
+    server.listen()
+    log(f"[*] TCP RAW entropy server listening on 0.0.0.0:{RAW_TELNET_PORT} (Internal)")
+
+    while True:
+        conn, address = server.accept()
+        threading.Thread(
+            target=raw_telnet_client_worker,
             args=(conn, address),
             daemon=True,
         ).start()
@@ -786,6 +848,7 @@ def _start_background_threads():
     )
     threading.Thread(target=udp_receiver_worker, daemon=True).start()
     threading.Thread(target=telnet_server_worker, daemon=True).start()
+    threading.Thread(target=raw_telnet_server_worker, daemon=True).start()
     threading.Thread(target=cleanup_incomplete_images_worker, daemon=True).start()
     threading.Thread(target=stats_logger_worker, daemon=True).start()
     log("[*] Entropy generator background threads online")

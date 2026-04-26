@@ -1,5 +1,7 @@
 # Big Bang Entropy Core Starter
 
+**Official project website:** [https://entropy.sparksome.pl](https://entropy.sparksome.pl)
+
 This directory contains the supporting files for a minimal open-source package of the project.
 
 The intended package consists of:
@@ -68,7 +70,7 @@ Services:
 
 The starter package is split into a few clearly separated components:
 
-- `generator` - central entropy server; receives SDR input, mixes it, stores it in a FIFO pool, and exposes public endpoints
+- `generator` - central entropy server; receives SDR input, mixes it, stores it in a consumable pool, and exposes public endpoints
 - `sdr-node` - local SDR worker connected to PlutoSDR; captures raw radio samples, extracts random material, and sends it to the generator over UDP
 - `nginx` - serves the static dashboard and proxies HTTP requests to the generator
 - `audit` - periodically checks generator output quality and writes public audit reports to `/reports/`
@@ -149,7 +151,7 @@ The system does not rely on software pseudo-randomness alone.
 
 At the node level, PlutoSDR captures physical radio noise and ADC-level instability from the real RF chain. The SDR worker selects the most useful noisy bits, reduces bias and correlation, and forwards that material to the generator.
 
-At the generator level, data from one or more nodes is mixed with a SHA-512-based mechanism before it enters the public FIFO pool. This adds cryptographic resilience and helps separate public output from the raw internal state.
+At the generator level, data from one or more nodes is mixed with a SHA-512-based mechanism before it enters the public consumable pool. This adds cryptographic resilience and helps separate public output from the raw internal state.
 
 ## Algorithm Notes
 
