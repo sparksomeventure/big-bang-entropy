@@ -17,6 +17,7 @@ import matplotlib
 import numpy as np
 from matplotlib.collections import LineCollection
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.ticker import FuncFormatter
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -114,6 +115,12 @@ WATERFALL_LINE_CMAP = LinearSegmentedColormap.from_list(
 
 def log(message: str):
     print(message, flush=True)
+
+
+def get_display_frequency_axis():
+    if DISPLAY_FREQ_HZ >= 1_000_000_000:
+        return 1_000_000_000.0, "GHz"
+    return 1_000_000.0, "MHz"
 
 
 def resolve_radio_frequencies():
@@ -388,7 +395,10 @@ def waterfall_sender_worker():
             psd_db = 10 * np.log10(psd + 1e-9)
             freqs = np.fft.fftshift(np.fft.fftfreq(len(iq_complex), d=1 / 2.084e6)) / 1e6
 
-            x = freqs + (DISPLAY_FREQ_HZ / 1e6)
+            axis_scale_hz, axis_unit = get_display_frequency_axis()
+            axis_center = DISPLAY_FREQ_HZ / axis_scale_hz
+            axis_span = freqs / (axis_scale_hz / 1e6)
+            x = axis_span + axis_center
             y = psd_db
             waterfall_history.append(y.copy())
             history_frames = list(waterfall_history)
@@ -461,16 +471,18 @@ def waterfall_sender_worker():
             ax.scatter(x[::64], y[::64], s=6, c=THEME_ACCENT, alpha=0.35, linewidths=0, zorder=5)
 
             ax.set_title(
-                f"Node {NODE_NAME} - Cosmic Noise @ {DISPLAY_FREQ_HZ / 1e6:.3f} MHz",
+                f"Node {NODE_NAME} - Cosmic Noise @ {DISPLAY_FREQ_HZ / axis_scale_hz:.3f} {axis_unit}",
                 color=THEME_PRIMARY,
                 fontsize=12,
                 pad=12,
             )
-            ax.set_xlabel("Frequency [MHz]", color=THEME_PRIMARY)
+            ax.set_xlabel(f"Frequency [{axis_unit}]", color=THEME_PRIMARY)
             ax.set_ylabel("Power [dB]", color=THEME_PRIMARY)
             ax.grid(True, alpha=0.16, color=THEME_PRIMARY, linestyle=":")
             ax.set_ylim(y_min, y_max)
             ax.tick_params(colors=THEME_PRIMARY)
+            ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.3f}"))
+            ax.xaxis.offsetText.set_visible(False)
             for spine in ax.spines.values():
                 spine.set_color(THEME_PRIMARY)
                 spine.set_alpha(0.7)
