@@ -88,7 +88,17 @@ def log(message: str):
 
 
 def build_iio_context():
-    return iio.Context(f"ip:{PLUTO_IP}")
+    if not PLUTO_IP or PLUTO_IP.lower() in ("local", "usb", "auto"):
+        log("[*] Searching for local/USB IIO context (auto-discovery)...")
+        return iio.Context()
+
+    uri = PLUTO_IP
+    if ":" not in uri:
+        # Default to IP if only an address/hostname is provided
+        uri = f"ip:{PLUTO_IP}"
+
+    log(f"[*] Attempting to connect to IIO context: {uri}")
+    return iio.Context(uri)
 
 
 def configure_radio(ctx):
@@ -500,17 +510,17 @@ if __name__ == "__main__":
     # Main initialization loop - process won't start workers until hardware is ready
     for attempt in range(1, 11):
         try:
-            log(f"[*] SDR init attempt {attempt}/10...")
+            log(f"[*] SDR init attempt {attempt}/10 (Source: {PLUTO_IP})...")
             sdr_ctx = build_iio_context()
             sdr_dev = configure_radio(sdr_ctx)
             # 32768 samples = 128KB (safe middle ground)
             sdr_buffer = iio.Buffer(sdr_dev, 32768)
-            log(f"[*] SDR successfully initialized on {PLUTO_IP}")
+            log(f"[*] SDR successfully initialized. Context: {sdr_ctx.name}, Description: {sdr_ctx.description}")
             break
         except Exception as exc:
             log(f"[!] SDR init failed: {exc}")
             if sdr_ctx:
-                # Explicitly clean up context to free network resources on Pluto
+                # Explicitly clean up context to free network resources
                 del sdr_ctx
                 sdr_ctx = None
             time.sleep(10)
