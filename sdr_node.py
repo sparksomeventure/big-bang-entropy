@@ -163,35 +163,11 @@ def get_latest_raw_iq_snapshot():
         return latest_raw_iq, latest_raw_iq_at
 
 
-def entropy_sender_worker():
+def entropy_sender_worker(buffer):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    sdr_ready = False
-    ctx = None
-    data_dev = None
-    buffer = None
-
-    for attempt in range(1, 6):
-        try:
-            ctx = build_iio_context()
-            data_dev = configure_radio(ctx)
-            buffer = iio.Buffer(data_dev, 65536)
-            sdr_ready = True
-            log(
-                f"[*] SDR sample stream ready (node={NODE_NAME}, pluto_ip={PLUTO_IP}, "
-                f"freq={FREQ}, gain={GAIN}, rx_channel={RX_CHANNEL}, "
-                f"sample_packet_bytes={SAMPLE_PACKET_BYTES}, attempt={attempt})"
-            )
-            break
-        except Exception as exc:
-            log(f"[!] SDR init attempt {attempt} failed: {exc}")
-            time.sleep(5)
-
-    if not sdr_ready:
-        log("[!] Fatal: Could not initialize SDR after 5 attempts. Exiting.")
-        os._exit(1)
-
     entropy_accumulator = bytearray()
+
+    log(f"[*] Entropy sender worker active (node={NODE_NAME})")
 
     while True:
         try:
@@ -510,12 +486,43 @@ def stats_logger_worker():
 
 if __name__ == "__main__":
     log(
-        f"[*] SDR node {NODE_NAME} streaming to "
-        f"{UDP_TARGET_HOST}:{UDP_TARGET_PORT} from Pluto {PLUTO_IP}"
+        f"[*] SDR node {NODE_NAME} starting. Target: "
+        f"{UDP_TARGET_HOST}:{UDP_TARGET_PORT}, Source: Pluto {PLUTO_IP}"
     )
-    threading.Thread(target=entropy_sender_worker, daemon=True).start()
+
+    # Give Pluto a moment to breathe after previous container restart
+    time.sleep(5)
+
+    sdr_ctx = None
+    sdr_dev = None
+    sdr_buffer = None
+
+    # Main initialization loop - process won't start workers until hardware is ready
+    for attempt in range(1, 11):
+        try:
+            log(f"[*] SDR init attempt {attempt}/10...")
+            sdr_ctx = build_iio_context()
+            sdr_dev = configure_radio(sdr_ctx)
+            # 32768 samples = 128KB (safe middle ground)
+            sdr_buffer = iio.Buffer(sdr_dev, 32768)
+            log(f"[*] SDR successfully initialized on {PLUTO_IP}")
+            break
+        except Exception as exc:
+            log(f"[!] SDR init failed: {exc}")
+            if sdr_ctx:
+                # Explicitly clean up context to free network resources on Pluto
+                del sdr_ctx
+                sdr_ctx = None
+            time.sleep(10)
+    else:
+        log("[!] Fatal: Could not initialize SDR after 10 attempts. Exiting.")
+        os._exit(1)
+
+    # Start workers - pass the initialized buffer to the sampler thread
+    threading.Thread(target=entropy_sender_worker, args=(sdr_buffer,), daemon=True).start()
     threading.Thread(target=waterfall_sender_worker, daemon=True).start()
     threading.Thread(target=source_audit_worker, daemon=True).start()
     threading.Thread(target=stats_logger_worker, daemon=True).start()
+
     while True:
         time.sleep(60)
