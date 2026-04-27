@@ -166,18 +166,29 @@ def get_latest_raw_iq_snapshot():
 def entropy_sender_worker():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    try:
-        ctx = build_iio_context()
-        data_dev = configure_radio(ctx)
-        buffer = iio.Buffer(data_dev, 65536)
-        log(
-            f"[*] SDR sample stream ready (node={NODE_NAME}, pluto_ip={PLUTO_IP}, "
-            f"freq={FREQ}, gain={GAIN}, rx_channel={RX_CHANNEL}, "
-            f"sample_packet_bytes={SAMPLE_PACKET_BYTES})"
-        )
-    except Exception as exc:
-        log(f"[!] SDR init error: {exc}")
-        time.sleep(10)
+    sdr_ready = False
+    ctx = None
+    data_dev = None
+    buffer = None
+
+    for attempt in range(1, 6):
+        try:
+            ctx = build_iio_context()
+            data_dev = configure_radio(ctx)
+            buffer = iio.Buffer(data_dev, 65536)
+            sdr_ready = True
+            log(
+                f"[*] SDR sample stream ready (node={NODE_NAME}, pluto_ip={PLUTO_IP}, "
+                f"freq={FREQ}, gain={GAIN}, rx_channel={RX_CHANNEL}, "
+                f"sample_packet_bytes={SAMPLE_PACKET_BYTES}, attempt={attempt})"
+            )
+            break
+        except Exception as exc:
+            log(f"[!] SDR init attempt {attempt} failed: {exc}")
+            time.sleep(5)
+
+    if not sdr_ready:
+        log("[!] Fatal: Could not initialize SDR after 5 attempts. Exiting.")
         os._exit(1)
 
     entropy_accumulator = bytearray()
@@ -264,23 +275,17 @@ def entropy_sender_worker():
 def waterfall_sender_worker():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    try:
-        ctx = build_iio_context()
-        data_dev = configure_radio(ctx)
-        viz_buffer = iio.Buffer(data_dev, 16384)
-        log(
-            f"[*] Waterfall stream ready (node={NODE_NAME}, interval={WATERFALL_INTERVAL_SEC}s, "
-            f"udp_chunk_bytes={WATERFALL_UDP_CHUNK_BYTES})"
-        )
-    except Exception as exc:
-        log(f"[!] Waterfall init error: {exc}")
-        time.sleep(10)
-        os._exit(1)
+    log(
+        f"[*] Waterfall worker ready (node={NODE_NAME}, interval={WATERFALL_INTERVAL_SEC}s, "
+        f"udp_chunk_bytes={WATERFALL_UDP_CHUNK_BYTES}, source=shared_raw_iq)"
+    )
 
     while True:
         try:
-            viz_buffer.refill()
-            raw_iq = viz_buffer.read()
+            raw_iq, raw_iq_at = get_latest_raw_iq_snapshot()
+            if raw_iq is None:
+                time.sleep(2)
+                continue
 
             iq = np.frombuffer(raw_iq, dtype=np.int16).astype(np.float32)
             iq_complex = iq[0::2] + 1j * iq[1::2]
