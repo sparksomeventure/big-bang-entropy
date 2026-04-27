@@ -12,4 +12,4 @@ COPY entropy_server.py .
 
 EXPOSE 8080 1420 5005/udp
 
-CMD ["gunicorn", "-w", "1", "--threads", "16", "-b", "0.0.0.0:8080", "entropy_server:app"]
+CMD ["gunicorn", "-w", "1", "--threads", "16", "--access-logfile", "-", "--error-logfile", "-", "--capture-output", "-b", "0.0.0.0:8080", "entropy_server:app"]

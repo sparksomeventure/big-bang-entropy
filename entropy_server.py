@@ -133,7 +133,7 @@ def _source_audit_summary(audit: Optional[Dict[str, object]], now: Optional[floa
     if not audit:
         return {
             "status": "MISSING",
-            "accepting_samples": True,
+            "accepting_samples": False,
             "repeat_score": None,
             "age_sec": None,
         }
@@ -143,7 +143,7 @@ def _source_audit_summary(audit: Optional[Dict[str, object]], now: Optional[floa
     repeat_score = audit.get("repeat_score")
     if age_sec is not None and age_sec > SOURCE_AUDIT_MAX_AGE_SEC:
         status = "STALE"
-        accepting = True
+        accepting = False
     elif isinstance(repeat_score, (int, float)) and repeat_score >= SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD:
         status = "WARN"
         accepting = False

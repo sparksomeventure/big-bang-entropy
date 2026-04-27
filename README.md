@@ -180,7 +180,8 @@ and also enriches `/sources` with the latest source-audit status so the main aud
 show source-level warnings.
 
 The raw-signal audit computes a `repeat_score`. When the latest score for a node exceeds
-`SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD`, the generator will:
+`SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD`, or when the node has not sent any raw-signal audit yet,
+the generator will:
 
 - stop accepting entropy packets from that node
 - keep the node visible in status output
