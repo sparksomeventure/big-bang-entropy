@@ -33,6 +33,9 @@ WATERFALL_AXIS_WINDOW_SEC = int(os.getenv("WATERFALL_AXIS_WINDOW_SEC", "30"))
 SOURCE_AUDIT_INTERVAL_SEC = int(os.getenv("SOURCE_AUDIT_INTERVAL_SEC", str(24 * 60 * 60)))
 SOURCE_AUDIT_SAMPLE_BYTES = int(os.getenv("SOURCE_AUDIT_SAMPLE_BYTES", str(256 * 1024)))
 LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
+SDR_TYPE = os.getenv("SDR_TYPE", "pluto").lower()
+RTL_SDR_INDEX = int(os.getenv("RTL_SDR_INDEX", "0"))
+SAMPLE_RATE = float(os.getenv("SAMPLE_RATE", "2.048e6"))
 
 runtime_stats = {
     "sample_packets_sent": 0,
@@ -173,22 +176,30 @@ def get_latest_raw_iq_snapshot():
         return latest_raw_iq, latest_raw_iq_at
 
 
-def entropy_sender_worker(buffer):
+def entropy_sender_worker(source):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     entropy_accumulator = bytearray()
 
-    log(f"[*] Entropy sender worker active (node={NODE_NAME})")
+    log(f"[*] Entropy sender worker active (node={NODE_NAME}, type={SDR_TYPE})")
 
     while True:
         try:
-            buffer.refill()
-            raw_data = buffer.read()
+            if SDR_TYPE == "rtlsdr":
+                # read_bytes(n) returns bytes/bytearray for RTL-SDR
+                raw_data = source.read_bytes(65536)
+            else:
+                # buffer.refill() for PlutoSDR
+                source.refill()
+                raw_data = source.read()
+
             update_latest_raw_iq(raw_data)
 
             # --- OPTIMIZED DSP PIPELINE (multi-bit XOR-fold + Von Neumann) ---
-            # 1. Parse raw IQ samples as signed 16-bit integers
-            limit = len(raw_data) - (len(raw_data) % 2)
-            samples = np.frombuffer(raw_data[:limit], dtype=np.int16)
+            # 1. Parse raw IQ samples
+            dtype = np.uint8 if SDR_TYPE == "rtlsdr" else np.int16
+            # Ensure we have a multiple of sample size (2 bytes for RTL, 4 for Pluto)
+            limit = len(raw_data) - (len(raw_data) % (2 if SDR_TYPE == "rtlsdr" else 4))
+            samples = np.frombuffer(raw_data[:limit], dtype=dtype).astype(np.int16)
 
             # 2. Light decimation [::4] – PlutoSDR AD9361 auto-correlation drops
             #    within 3-4 samples (Nyquist oversampling), so [::37] was wasting
@@ -273,7 +284,12 @@ def waterfall_sender_worker():
                 time.sleep(2)
                 continue
 
-            iq = np.frombuffer(raw_iq, dtype=np.int16).astype(np.float32)
+            dtype = np.uint8 if SDR_TYPE == "rtlsdr" else np.int16
+            iq = np.frombuffer(raw_iq, dtype=dtype).astype(np.float32)
+            if SDR_TYPE == "rtlsdr":
+                # Center 8-bit unsigned (0..255) to avoid huge DC spike in FFT
+                iq = iq - 127.5
+
             iq_complex = iq[0::2] + 1j * iq[1::2]
 
             psd = np.abs(np.fft.fftshift(np.fft.fft(iq_complex))) ** 2
@@ -508,28 +524,35 @@ if __name__ == "__main__":
     sdr_buffer = None
 
     # Main initialization loop - process won't start workers until hardware is ready
+    sdr_source = None
     for attempt in range(1, 11):
         try:
-            log(f"[*] SDR init attempt {attempt}/10 (Source: {PLUTO_IP})...")
-            sdr_ctx = build_iio_context()
-            sdr_dev = configure_radio(sdr_ctx)
-            # 32768 samples = 128KB (safe middle ground)
-            sdr_buffer = iio.Buffer(sdr_dev, 32768)
-            log(f"[*] SDR successfully initialized. Context: {sdr_ctx.name}, Description: {sdr_ctx.description}")
+            log(f"[*] SDR init attempt {attempt}/10 (Type: {SDR_TYPE})...")
+            if SDR_TYPE == "rtlsdr":
+                from rtlsdr import RtlSdr
+                sdr_obj = RtlSdr(device_index=RTL_SDR_INDEX)
+                sdr_obj.sample_rate = SAMPLE_RATE
+                sdr_obj.center_freq = FREQ
+                sdr_obj.gain = GAIN
+                sdr_source = sdr_obj
+                log(f"[*] RTL-SDR successfully initialized: {sdr_obj}")
+            else:
+                sdr_ctx = build_iio_context()
+                sdr_dev = configure_radio(sdr_ctx)
+                # 32768 samples = 128KB (safe middle ground)
+                sdr_buffer = iio.Buffer(sdr_dev, 32768)
+                sdr_source = sdr_buffer
+                log(f"[*] PlutoSDR successfully initialized. Context: {sdr_ctx.name}")
             break
         except Exception as exc:
             log(f"[!] SDR init failed: {exc}")
-            if sdr_ctx:
-                # Explicitly clean up context to free network resources
-                del sdr_ctx
-                sdr_ctx = None
             time.sleep(10)
     else:
         log("[!] Fatal: Could not initialize SDR after 10 attempts. Exiting.")
         os._exit(1)
 
-    # Start workers - pass the initialized buffer to the sampler thread
-    threading.Thread(target=entropy_sender_worker, args=(sdr_buffer,), daemon=True).start()
+    # Start workers - pass the initialized source to the sampler thread
+    threading.Thread(target=entropy_sender_worker, args=(sdr_source,), daemon=True).start()
     threading.Thread(target=waterfall_sender_worker, daemon=True).start()
     threading.Thread(target=source_audit_worker, daemon=True).start()
     threading.Thread(target=stats_logger_worker, daemon=True).start()
