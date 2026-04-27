@@ -30,6 +30,8 @@ WATERFALL_INTERVAL_SEC = int(os.getenv("WATERFALL_INTERVAL_SEC", "10"))
 WATERFALL_UDP_CHUNK_BYTES = int(os.getenv("WATERFALL_UDP_CHUNK_BYTES", "48000"))
 WATERFALL_HISTORY_FRAMES = int(os.getenv("WATERFALL_HISTORY_FRAMES", "5"))
 WATERFALL_AXIS_WINDOW_SEC = int(os.getenv("WATERFALL_AXIS_WINDOW_SEC", "30"))
+SOURCE_AUDIT_INTERVAL_SEC = int(os.getenv("SOURCE_AUDIT_INTERVAL_SEC", str(24 * 60 * 60)))
+SOURCE_AUDIT_SAMPLE_BYTES = int(os.getenv("SOURCE_AUDIT_SAMPLE_BYTES", str(256 * 1024)))
 LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
 
 runtime_stats = {
@@ -37,8 +39,10 @@ runtime_stats = {
     "sample_bytes_sent": 0,
     "waterfalls_sent": 0,
     "waterfall_parts_sent": 0,
+    "source_audits_sent": 0,
     "last_sample_at": 0.0,
     "last_waterfall_at": 0.0,
+    "last_source_audit_at": 0.0,
 }
 stats_lock = threading.Lock()
 waterfall_history = deque(maxlen=max(1, WATERFALL_HISTORY_FRAMES))
@@ -100,6 +104,45 @@ def configure_radio(ctx):
 def udp_send(sock: socket.socket, message: dict):
     payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
     sock.sendto(payload, (UDP_TARGET_HOST, UDP_TARGET_PORT))
+
+
+def analyze_raw_signal(raw_iq: bytes):
+    limit = len(raw_iq) - (len(raw_iq) % 2)
+    samples = np.frombuffer(raw_iq[:limit], dtype=np.int16)
+    if samples.size < 2:
+        return None
+
+    sample_count = int(samples.size)
+    unique_values, counts = np.unique(samples, return_counts=True)
+    dominant_value_ratio = float(counts.max() / sample_count)
+    consecutive_equal_ratio = float(np.mean(samples[1:] == samples[:-1]))
+    mean = float(np.mean(samples))
+    stddev = float(np.std(samples))
+
+    iq_i = samples[0::2].astype(np.float32)
+    iq_q = samples[1::2].astype(np.float32)
+    iq_len = min(iq_i.size, iq_q.size)
+    if iq_len >= 16:
+        iq_complex = iq_i[:iq_len] + 1j * iq_q[:iq_len]
+        psd = np.abs(np.fft.fft(iq_complex)) ** 2 + 1e-12
+        spectral_flatness = float(np.exp(np.mean(np.log(psd))) / np.mean(psd))
+    else:
+        spectral_flatness = 1.0
+
+    repeat_score = max(dominant_value_ratio, consecutive_equal_ratio, 1.0 - spectral_flatness)
+    return {
+        "sample_bytes": int(limit),
+        "sample_count": sample_count,
+        "unique_values": int(unique_values.size),
+        "mean": round(mean, 4),
+        "stddev": round(stddev, 4),
+        "min_value": int(samples.min()),
+        "max_value": int(samples.max()),
+        "dominant_value_ratio": round(dominant_value_ratio, 6),
+        "consecutive_equal_ratio": round(consecutive_equal_ratio, 6),
+        "spectral_flatness": round(spectral_flatness, 6),
+        "repeat_score": round(float(min(max(repeat_score, 0.0), 1.0)), 6),
+    }
 
 
 def entropy_sender_worker():
@@ -367,6 +410,54 @@ def waterfall_sender_worker():
             time.sleep(2)
 
 
+def source_audit_worker():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    try:
+        ctx = build_iio_context()
+        data_dev = configure_radio(ctx)
+        buffer_samples = max(16384, SOURCE_AUDIT_SAMPLE_BYTES // 4)
+        audit_buffer = iio.Buffer(data_dev, buffer_samples)
+        log(
+            f"[*] Source audit stream ready (node={NODE_NAME}, interval={SOURCE_AUDIT_INTERVAL_SEC}s, "
+            f"sample_bytes~={SOURCE_AUDIT_SAMPLE_BYTES})"
+        )
+    except Exception as exc:
+        log(f"[!] Source audit init error: {exc}")
+        time.sleep(10)
+        os._exit(1)
+
+    while True:
+        try:
+            audit_buffer.refill()
+            raw_iq = audit_buffer.read()[:SOURCE_AUDIT_SAMPLE_BYTES]
+            metrics = analyze_raw_signal(raw_iq)
+            if metrics is None:
+                time.sleep(5)
+                continue
+
+            udp_send(
+                sock,
+                {
+                    "type": "source_audit",
+                    "node": NODE_NAME,
+                    "timestamp": time.time(),
+                    "metrics": metrics,
+                },
+            )
+            with stats_lock:
+                runtime_stats["source_audits_sent"] += 1
+                runtime_stats["last_source_audit_at"] = time.time()
+            log(
+                f"[*] Source audit sent (node={NODE_NAME}, repeat_score={metrics['repeat_score']}, "
+                f"spectral_flatness={metrics['spectral_flatness']})"
+            )
+            time.sleep(max(1, SOURCE_AUDIT_INTERVAL_SEC))
+        except Exception as exc:
+            log(f"[!] Source audit error: {exc}")
+            time.sleep(5)
+
+
 def stats_logger_worker():
     while True:
         time.sleep(LOG_EVERY_SEC)
@@ -382,6 +473,11 @@ def stats_logger_worker():
             if snapshot["last_waterfall_at"]
             else None
         )
+        last_source_audit_age = (
+            round(time.time() - snapshot["last_source_audit_at"], 1)
+            if snapshot["last_source_audit_at"]
+            else None
+        )
         log(
             "[*] SDR node stats: "
             f"node={NODE_NAME}, "
@@ -389,8 +485,10 @@ def stats_logger_worker():
             f"sample_bytes_sent={snapshot['sample_bytes_sent']}, "
             f"waterfalls_sent={snapshot['waterfalls_sent']}, "
             f"waterfall_parts_sent={snapshot['waterfall_parts_sent']}, "
+            f"source_audits_sent={snapshot['source_audits_sent']}, "
             f"last_sample_age_sec={last_sample_age}, "
-            f"last_waterfall_age_sec={last_waterfall_age}"
+            f"last_waterfall_age_sec={last_waterfall_age}, "
+            f"last_source_audit_age_sec={last_source_audit_age}"
         )
 
 
@@ -401,6 +499,7 @@ if __name__ == "__main__":
     )
     threading.Thread(target=entropy_sender_worker, daemon=True).start()
     threading.Thread(target=waterfall_sender_worker, daemon=True).start()
+    threading.Thread(target=source_audit_worker, daemon=True).start()
     threading.Thread(target=stats_logger_worker, daemon=True).start()
     while True:
         time.sleep(60)

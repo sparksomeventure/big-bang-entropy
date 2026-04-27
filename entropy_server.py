@@ -6,6 +6,7 @@ import socket
 import string
 import threading
 import time
+from pathlib import Path
 from typing import Dict, Optional
 
 from flask import Flask, Response, jsonify, request, stream_with_context
@@ -29,6 +30,15 @@ RAW_POOL_MAX_BYTES = RAW_POOL_SIZE_MB * 1024 * 1024
 IMAGE_ASSEMBLY_TTL_SEC = int(os.getenv("IMAGE_ASSEMBLY_TTL_SEC", "60"))
 WATERFALL_HISTORY_FRAMES = int(os.getenv("WATERFALL_HISTORY_FRAMES", "5"))
 NODE_TTL_SEC = int(os.getenv("NODE_TTL_SEC", str(6 * 60 * 60)))
+SOURCE_AUDIT_STATE_PATH = Path(
+    os.getenv("SOURCE_AUDIT_STATE_PATH", "/tmp/bbe-source-audits.json")
+)
+SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD = float(
+    os.getenv("SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD", "0.9")
+)
+SOURCE_AUDIT_MAX_AGE_SEC = int(
+    os.getenv("SOURCE_AUDIT_MAX_AGE_SEC", str(36 * 60 * 60))
+)
 MIX_BLOCK_BYTES = int(os.getenv("MIX_BLOCK_BYTES", "64"))
 LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
 LOW_POOL_THRESHOLD_PCT = float(os.getenv("LOW_POOL_THRESHOLD_PCT", "10"))
@@ -67,6 +77,9 @@ generator_state_lock = threading.Lock()
 node_stats: Dict[str, Dict[str, object]] = {}
 node_stats_lock = threading.Lock()
 
+source_audits: Dict[str, Dict[str, object]] = {}
+source_audits_lock = threading.Lock()
+
 
 def log(message: str):
     print(message, flush=True)
@@ -92,6 +105,70 @@ def _store_entropy(payload: bytes):
     with pool_lock:
         entropy_pool.extend(payload)
         _clamp_pool()
+
+
+def _persist_source_audits():
+    try:
+        SOURCE_AUDIT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with source_audits_lock:
+            snapshot = {
+                "generated_at": time.time(),
+                "repeat_score_threshold": SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD,
+                "max_age_sec": SOURCE_AUDIT_MAX_AGE_SEC,
+                "nodes": {
+                    node_name: dict(state)
+                    for node_name, state in sorted(source_audits.items())
+                },
+            }
+        SOURCE_AUDIT_STATE_PATH.write_text(
+            json.dumps(snapshot, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        log(f"[!] Could not persist source audits to {SOURCE_AUDIT_STATE_PATH}: {exc}")
+
+
+def _source_audit_summary(audit: Optional[Dict[str, object]], now: Optional[float] = None):
+    now = time.time() if now is None else now
+    if not audit:
+        return {
+            "status": "MISSING",
+            "accepting_samples": True,
+            "repeat_score": None,
+            "age_sec": None,
+        }
+
+    updated_at = float(audit.get("updated_at", 0.0) or 0.0)
+    age_sec = round(now - updated_at, 1) if updated_at else None
+    repeat_score = audit.get("repeat_score")
+    if age_sec is not None and age_sec > SOURCE_AUDIT_MAX_AGE_SEC:
+        status = "STALE"
+        accepting = True
+    elif isinstance(repeat_score, (int, float)) and repeat_score >= SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD:
+        status = "WARN"
+        accepting = False
+    else:
+        status = "OK"
+        accepting = True
+
+    return {
+        "status": status,
+        "accepting_samples": accepting,
+        "repeat_score": repeat_score,
+        "age_sec": age_sec,
+    }
+
+
+def _update_source_audit(node_name: str, audit_payload: Dict[str, object]):
+    with source_audits_lock:
+        source_audits[node_name] = audit_payload
+    _persist_source_audits()
+
+
+def _node_accepts_samples(node_name: str) -> bool:
+    with source_audits_lock:
+        audit = source_audits.get(node_name)
+    return _source_audit_summary(audit)["accepting_samples"]
 
 
 def _pop_entropy_chunk(chunk_size: int) -> Optional[bytes]:
@@ -222,7 +299,7 @@ def _store_waterfall(node_name: str, frame_id: str, image_format: str, image_byt
     )
 
 
-def _update_node_stats(node_name: str, raw_bytes: int, payload_bytes: int):
+def _update_node_stats(node_name: str, raw_bytes: int, payload_bytes: int, rejected: bool = False):
     with node_stats_lock:
         state = node_stats.setdefault(
             node_name,
@@ -231,12 +308,18 @@ def _update_node_stats(node_name: str, raw_bytes: int, payload_bytes: int):
                 "raw_bytes": 0,
                 "payload_bytes": 0,
                 "packets": 0,
+                "rejected_packets": 0,
+                "rejected_bytes": 0,
                 "last_seen": 0.0,
             },
         )
-        state["raw_bytes"] += raw_bytes
-        state["payload_bytes"] += payload_bytes
-        state["packets"] += 1
+        if rejected:
+            state["rejected_packets"] += 1
+            state["rejected_bytes"] += raw_bytes
+        else:
+            state["raw_bytes"] += raw_bytes
+            state["payload_bytes"] += payload_bytes
+            state["packets"] += 1
         state["last_seen"] = time.time()
 
 
@@ -253,6 +336,17 @@ def _cleanup_stale_nodes(now: Optional[float] = None):
         for node_name in stale_nodes:
             del node_stats[node_name]
 
+    source_audits_changed = False
+    with source_audits_lock:
+        stale_audits = [
+            node_name
+            for node_name, state in source_audits.items()
+            if state.get("updated_at", 0.0) < cutoff
+        ]
+        for node_name in stale_audits:
+            del source_audits[node_name]
+            source_audits_changed = True
+
     with waterfalls_lock:
         stale_waterfalls = [
             node_name
@@ -262,26 +356,41 @@ def _cleanup_stale_nodes(now: Optional[float] = None):
         for node_name in stale_waterfalls:
             del waterfalls[node_name]
 
+    if source_audits_changed:
+        _persist_source_audits()
+
 
 def _snapshot_sources():
     _cleanup_stale_nodes()
     now = time.time()
+    with source_audits_lock:
+        audit_snapshot = {
+            node_name: dict(state) for node_name, state in source_audits.items()
+        }
     with node_stats_lock:
         payload = []
         for node_name, state in sorted(node_stats.items()):
             active_for = max(now - state["first_seen"], 1.0)
+            audit_info = audit_snapshot.get(node_name)
+            audit_summary = _source_audit_summary(audit_info, now=now)
             payload.append(
                 {
                     "node": node_name,
                     "raw_bytes": state["raw_bytes"],
                     "payload_bytes": state["payload_bytes"],
                     "packets": state["packets"],
+                    "rejected_packets": state.get("rejected_packets", 0),
+                    "rejected_bytes": state.get("rejected_bytes", 0),
                     "first_seen": state["first_seen"],
                     "last_seen": state["last_seen"],
                     "last_seen_age_sec": round(now - state["last_seen"], 1)
                     if state["last_seen"]
                     else None,
                     "avg_bytes_per_sec": round(state["raw_bytes"] / active_for, 1),
+                    "source_audit_status": audit_summary["status"],
+                    "source_audit_repeat_score": audit_summary["repeat_score"],
+                    "source_audit_age_sec": audit_summary["age_sec"],
+                    "accepting_samples": audit_summary["accepting_samples"],
                 }
             )
     return payload
@@ -397,6 +506,40 @@ def _handle_waterfall_part(message: dict):
         _store_waterfall(node_name, completed_frame_id, completed_format, completed_image)
 
 
+def _handle_source_audit(message: dict):
+    node_name = message.get("node")
+    metrics = message.get("metrics")
+    if not node_name or not isinstance(metrics, dict):
+        return
+
+    updated_at = time.time()
+    audit_payload = {
+        "node": node_name,
+        "captured_at": float(message.get("timestamp", updated_at)),
+        "updated_at": updated_at,
+        "sample_bytes": int(metrics.get("sample_bytes", 0) or 0),
+        "sample_count": int(metrics.get("sample_count", 0) or 0),
+        "mean": float(metrics.get("mean", 0.0) or 0.0),
+        "stddev": float(metrics.get("stddev", 0.0) or 0.0),
+        "dominant_value_ratio": float(metrics.get("dominant_value_ratio", 0.0) or 0.0),
+        "consecutive_equal_ratio": float(metrics.get("consecutive_equal_ratio", 0.0) or 0.0),
+        "spectral_flatness": float(metrics.get("spectral_flatness", 0.0) or 0.0),
+        "repeat_score": float(metrics.get("repeat_score", 0.0) or 0.0),
+        "min_value": int(metrics.get("min_value", 0) or 0),
+        "max_value": int(metrics.get("max_value", 0) or 0),
+    }
+    summary = _source_audit_summary(audit_payload, now=updated_at)
+    audit_payload["status"] = summary["status"]
+    audit_payload["accepting_samples"] = summary["accepting_samples"]
+    audit_payload["repeat_score_threshold"] = SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD
+    _update_source_audit(node_name, audit_payload)
+    log(
+        f"[*] Source audit updated for node={node_name} "
+        f"(repeat_score={audit_payload['repeat_score']:.4f}, "
+        f"accepting_samples={audit_payload['accepting_samples']})"
+    )
+
+
 def udp_receiver_worker():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_HOST, UDP_PORT))
@@ -421,10 +564,16 @@ def udp_receiver_worker():
             except Exception:
                 continue
             source_timestamp = float(message.get("timestamp", time.time()))
+            if not _node_accepts_samples(node_name):
+                _update_node_stats(node_name, len(raw_payload), 0, rejected=True)
+                log(f"[!] Rejecting samples from node={node_name} due to source audit repeat threshold.")
+                continue
             _update_node_stats(node_name, len(raw_payload), len(raw_payload))
             _mix_samples_into_entropy(node_name, raw_payload, source_timestamp)
         elif msg_type == "waterfall":
             _handle_waterfall_part(message)
+        elif msg_type == "source_audit":
+            _handle_source_audit(message)
 
 
 def telnet_client_worker(conn: socket.socket, address):
@@ -570,6 +719,10 @@ def healthz():
         node_count = len(waterfalls)
     with node_stats_lock:
         source_nodes = len(node_stats)
+    with source_audits_lock:
+        rejecting_nodes = sum(
+            1 for audit in source_audits.values() if not _source_audit_summary(audit)["accepting_samples"]
+        )
     return jsonify(
         {
             "status": "ok",
@@ -587,6 +740,9 @@ def healthz():
             "udp_port": UDP_PORT,
             "nodes_with_waterfall": node_count,
             "source_nodes": source_nodes,
+            "rejecting_source_nodes": rejecting_nodes,
+            "source_audit_repeat_score_threshold": SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD,
+            "source_audit_state_path": str(SOURCE_AUDIT_STATE_PATH),
         }
     )
 
@@ -649,6 +805,19 @@ def list_waterfalls():
 @app.route("/sources")
 def list_sources():
     return jsonify(_snapshot_sources())
+
+
+@app.route("/source-audits")
+def list_source_audits():
+    _cleanup_stale_nodes()
+    now = time.time()
+    with source_audits_lock:
+        payload = []
+        for node_name, state in sorted(source_audits.items()):
+            item = dict(state)
+            item["age_sec"] = round(now - state["updated_at"], 1) if state.get("updated_at") else None
+            payload.append(item)
+    return jsonify(payload)
 
 
 @app.route("/waterfall")
@@ -816,6 +985,7 @@ def stats_logger_worker():
             sources = {
                 node_name: {
                     "packets": state["packets"],
+                    "rejected_packets": state.get("rejected_packets", 0),
                     "raw_bytes": state["raw_bytes"],
                     "last_seen": round(time.time() - state["last_seen"], 1)
                     if state["last_seen"]
@@ -825,13 +995,19 @@ def stats_logger_worker():
             }
         with waterfalls_lock:
             waterfall_nodes = sorted(waterfalls.keys())
+        with source_audits_lock:
+            audit_states = {
+                node_name: _source_audit_summary(audit)
+                for node_name, audit in sorted(source_audits.items())
+            }
 
         log(
             "[*] Generator stats: "
             f"pool_bytes={pool_bytes}, "
             f"source_nodes={len(sources)}, "
             f"waterfalls={waterfall_nodes}, "
-            f"sources={sources}"
+            f"sources={sources}, "
+            f"source_audits={audit_states}"
         )
 
 
@@ -844,7 +1020,8 @@ def _start_background_threads():
         f"telnet_session_bytes={_effective_telnet_session_bytes()}, "
         f"stream_chunk_bytes={STREAM_CHUNK_BYTES}, "
         f"low_pool_threshold_pct={LOW_POOL_THRESHOLD_PCT}, "
-        f"throttle_bytes_per_sec={THROTTLE_BYTES_PER_SEC})"
+        f"throttle_bytes_per_sec={THROTTLE_BYTES_PER_SEC}, "
+        f"source_audit_repeat_score_threshold={SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD})"
     )
     threading.Thread(target=udp_receiver_worker, daemon=True).start()
     threading.Thread(target=telnet_server_worker, daemon=True).start()

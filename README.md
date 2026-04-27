@@ -132,6 +132,7 @@ Common generator endpoints:
 - `/download/entropy` - returns entropy as a downloadable file
 - `/healthz` - basic service health and pool state
 - `/sources` - active SDR sources
+- `/source-audits` - latest raw-signal audits reported by SDR nodes
 - `/waterfalls` - available waterfall frames
 
 ## Audit Reports
@@ -144,6 +145,56 @@ Reports are written to the shared `/reports/` directory and can be published dir
 - a `JSON` report for automation
 - `SHA-256` checksum files
 - an integrity-chain record
+
+By default the audit stack runs a small set of representative `Dieharder` tests instead of a
+single subtest. `PractRand` is supported as an optional heavier stage and can be enabled with
+`AUDIT_PRACTRAND=1`.
+
+For a slower nightly audit profile, a practical example is:
+
+```env
+AUDIT_CRON=17 2 * * *
+AUDIT_SAMPLE_SIZE=67108864
+AUDIT_PREMIX_SIZE=33554432
+AUDIT_DIEHARDER_TESTS=0,1,2,8,15,100
+AUDIT_PRACTRAND=1
+AUDIT_PRACTRAND_TLMAX=1G
+AUDIT_PRACTRAND_MAX_BYTES=268435456
+```
+
+If `RNG_test` is not installed in the audit image, the audit report will add an alert instead of
+failing the whole run.
+
+## Raw SDR Signal Audits
+
+Each `sdr-node` also performs a separate audit of the raw SDR input before entropy extraction:
+
+- once immediately after container startup
+- then periodically, by default every `86400` seconds
+
+The node sends this diagnostic report to the generator as a separate UDP message
+`type: "source_audit"`, similar in spirit to the waterfall diagnostic stream.
+
+The generator keeps the latest raw-signal audit per node, exposes it through `/source-audits`,
+and also enriches `/sources` with the latest source-audit status so the main audit report can
+show source-level warnings.
+
+The raw-signal audit computes a `repeat_score`. When the latest score for a node exceeds
+`SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD`, the generator will:
+
+- stop accepting entropy packets from that node
+- keep the node visible in status output
+- mark the node as `WARN` rather than healthy
+
+Useful related settings:
+
+```env
+SOURCE_AUDIT_INTERVAL_SEC=86400
+SOURCE_AUDIT_SAMPLE_BYTES=262144
+SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD=0.9
+SOURCE_AUDIT_MAX_AGE_SEC=129600
+SOURCE_AUDIT_STATE_PATH=/tmp/bbe-source-audits.json
+```
 
 ## How Randomness Is Produced
 

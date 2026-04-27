@@ -18,6 +18,8 @@ SHA512_ROUNDS     = int(os.getenv("AUDIT_SHA512_ROUNDS", "32"))
 SOCKET_TIMEOUT    = float(os.getenv("AUDIT_SOCKET_TIMEOUT_SEC", "5"))
 MAX_SESSIONS      = int(os.getenv("AUDIT_MAX_TCP_SESSIONS", "1024"))
 PRACTRAND_ENABLED = os.getenv("AUDIT_PRACTRAND", "0") == "1"
+PRACTRAND_TLMAX   = os.getenv("AUDIT_PRACTRAND_TLMAX", "256M")
+PRACTRAND_MAX_BYTES = int(os.getenv("AUDIT_PRACTRAND_MAX_BYTES", str(32 * 1024 * 1024)))
 THROUGHPUT_WARN   = float(os.getenv("AUDIT_THROUGHPUT_WARN_MIB", "0.5"))
 
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -155,8 +157,15 @@ def evaluate_nodes(sources):
         age = round(now - last_seen, 1) if isinstance(last_seen, (int, float)) else None
         bps = item.get("avg_bytes_per_sec") or item.get("throughput_bps") or 0
         packets = item.get("packets", 0)
+        accepting_samples = item.get("accepting_samples", True)
+        source_audit_status = item.get("source_audit_status")
+        repeat_score = item.get("source_audit_repeat_score")
         if age is not None and age > 120:
             health = "FAIL"
+        elif not accepting_samples:
+            health = "WARN"
+        elif source_audit_status in ("WARN", "STALE"):
+            health = "WARN"
         elif age is not None and age > 30:
             health = "WARN"
         elif bps < 100:
@@ -164,7 +173,10 @@ def evaluate_nodes(sources):
         else:
             health = "OK"
         nodes.append({"node_id": node_id, "last_seen_age_sec": age,
-                      "avg_bytes_per_sec": bps, "packets": packets, "health": health})
+                      "avg_bytes_per_sec": bps, "packets": packets, "health": health,
+                      "accepting_samples": accepting_samples,
+                      "source_audit_status": source_audit_status,
+                      "source_audit_repeat_score": repeat_score})
     return nodes
 
 # ---------------------------------------------------------------------------
@@ -299,9 +311,27 @@ def render_html(report):
                       f'<td>{n.get("last_seen_age_sec","?")}</td>'
                       f'<td>{n.get("avg_bytes_per_sec","?")}</td>'
                       f'<td>{n.get("packets","?")}</td>'
+                      f'<td>{html.escape(str(n.get("source_audit_status","?")))}</td>'
+                      f'<td>{html.escape(str(n.get("source_audit_repeat_score","?")))}</td>'
                       f'<td style="color:{hc};font-weight:bold">{n["health"]}</td></tr>')
     if not node_rows:
-        node_rows = '<tr><td colspan="5">No node data</td></tr>'
+        node_rows = '<tr><td colspan="7">No node data</td></tr>'
+
+    source_audits = report.get("source_audits", [])
+    source_audit_rows = ""
+    for item in source_audits:
+        accepting = "yes" if item.get("accepting_samples", True) else "no"
+        source_audit_rows += (
+            f'<tr><td>{html.escape(str(item.get("node","unknown")))}</td>'
+            f'<td>{html.escape(str(item.get("status","?")))}</td>'
+            f'<td>{html.escape(str(item.get("repeat_score","?")))}</td>'
+            f'<td>{html.escape(str(item.get("spectral_flatness","?")))}</td>'
+            f'<td>{html.escape(str(item.get("dominant_value_ratio","?")))}</td>'
+            f'<td>{html.escape(str(item.get("consecutive_equal_ratio","?")))}</td>'
+            f'<td>{html.escape(accepting)}</td></tr>'
+        )
+    if not source_audit_rows:
+        source_audit_rows = '<tr><td colspan="7">No source audit data</td></tr>'
 
     # premix stats
     pm = report.get("premix_stats")
@@ -427,8 +457,14 @@ def render_html(report):
 
   <h2>Node health — source <span class="stage-badge">SDR</span></h2>
   <table>
-    <thead><tr><th>Node ID</th><th>Last seen (s ago)</th><th>Avg B/s</th><th>Packets</th><th>Health</th></tr></thead>
+    <thead><tr><th>Node ID</th><th>Last seen (s ago)</th><th>Avg B/s</th><th>Packets</th><th>Source audit</th><th>Repeat score</th><th>Health</th></tr></thead>
     <tbody>{node_rows}</tbody>
+  </table>
+
+  <h2>Latest source audits — raw/input <span class="stage-badge">SDR</span></h2>
+  <table>
+    <thead><tr><th>Node ID</th><th>Status</th><th>Repeat score</th><th>Spectral flatness</th><th>Dominant value ratio</th><th>Consecutive equal ratio</th><th>Accepting samples</th></tr></thead>
+    <tbody>{source_audit_rows}</tbody>
   </table>
 
   <h2>Generator parameters</h2>
@@ -487,10 +523,17 @@ def main():
         sources_raw = http_json(f"{TARGET_HTTP_URL}/sources")
     except Exception as e:
         alerts_early.append(f"Could not fetch /sources: {e}")
+    source_audits = []
+    try:
+        source_audits = http_json(f"{TARGET_HTTP_URL}/source-audits")
+    except Exception as e:
+        alerts_early.append(f"Could not fetch /source-audits: {e}")
 
     node_health = evaluate_nodes(sources_raw)
     if len(node_health) == 1:
         alerts_early.append("Only 1 SDR node contributing — single point of failure.")
+    if any(not item.get("accepting_samples", True) for item in source_audits):
+        alerts_early.append("One or more SDR nodes are currently blocked by the raw source audit repeat threshold.")
 
     # fetch final sample (post SHA-512) — stage 3
     sample = fetch_sample_via_tcp(SAMPLE_SIZE, port=TARGET_TCP_PORT)
@@ -532,7 +575,11 @@ def main():
 
         pr_result = None
         if PRACTRAND_ENABLED:
-            pr_result = run_cmd(["RNG_test", "stdin", "-tlmax", "256M"], stdin_bytes=sample["data"][:min(len(sample["data"]), 32*1024*1024)])
+            pr_input = sample["data"][:min(len(sample["data"]), max(1, PRACTRAND_MAX_BYTES))]
+            try:
+                pr_result = run_cmd(["RNG_test", "stdin", "-tlmax", PRACTRAND_TLMAX], stdin_bytes=pr_input)
+            except FileNotFoundError:
+                alerts_early.append("PractRand enabled, but RNG_test binary is not installed in the audit environment.")
 
     finally:
         sample_path.unlink(missing_ok=True)
@@ -583,6 +630,7 @@ def main():
         },
         "premix_stats": pm_stats,
         "node_health": node_health,
+        "source_audits": source_audits,
         "healthz": healthz,
         "sources": sources_raw,
         "environment": sys_snapshot(),
