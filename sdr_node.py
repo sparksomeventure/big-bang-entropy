@@ -45,6 +45,9 @@ runtime_stats = {
     "last_source_audit_at": 0.0,
 }
 stats_lock = threading.Lock()
+latest_raw_iq = None
+latest_raw_iq_at = 0.0
+latest_raw_iq_lock = threading.Lock()
 waterfall_history = deque(maxlen=max(1, WATERFALL_HISTORY_FRAMES))
 axis_window_frames = max(2, int(math.ceil(max(1, WATERFALL_AXIS_WINDOW_SEC) / max(1, WATERFALL_INTERVAL_SEC))))
 waterfall_axis_metrics = deque(maxlen=axis_window_frames)
@@ -145,6 +148,21 @@ def analyze_raw_signal(raw_iq: bytes):
     }
 
 
+def update_latest_raw_iq(raw_iq: bytes):
+    global latest_raw_iq, latest_raw_iq_at
+    snapshot = bytes(raw_iq[:SOURCE_AUDIT_SAMPLE_BYTES])
+    with latest_raw_iq_lock:
+        latest_raw_iq = snapshot
+        latest_raw_iq_at = time.time()
+
+
+def get_latest_raw_iq_snapshot():
+    with latest_raw_iq_lock:
+        if latest_raw_iq is None:
+            return None, 0.0
+        return latest_raw_iq, latest_raw_iq_at
+
+
 def entropy_sender_worker():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -168,6 +186,7 @@ def entropy_sender_worker():
         try:
             buffer.refill()
             raw_data = buffer.read()
+            update_latest_raw_iq(raw_data)
 
             # --- OPTIMIZED DSP PIPELINE (multi-bit XOR-fold + Von Neumann) ---
             # 1. Parse raw IQ samples as signed 16-bit integers
@@ -412,25 +431,17 @@ def waterfall_sender_worker():
 
 def source_audit_worker():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    try:
-        ctx = build_iio_context()
-        data_dev = configure_radio(ctx)
-        buffer_samples = max(16384, SOURCE_AUDIT_SAMPLE_BYTES // 4)
-        audit_buffer = iio.Buffer(data_dev, buffer_samples)
-        log(
-            f"[*] Source audit stream ready (node={NODE_NAME}, interval={SOURCE_AUDIT_INTERVAL_SEC}s, "
-            f"sample_bytes~={SOURCE_AUDIT_SAMPLE_BYTES})"
-        )
-    except Exception as exc:
-        log(f"[!] Source audit init error: {exc}")
-        time.sleep(10)
-        os._exit(1)
+    log(
+        f"[*] Source audit worker ready (node={NODE_NAME}, interval={SOURCE_AUDIT_INTERVAL_SEC}s, "
+        f"sample_bytes~={SOURCE_AUDIT_SAMPLE_BYTES}, source=shared_raw_iq)"
+    )
 
     while True:
         try:
-            audit_buffer.refill()
-            raw_iq = audit_buffer.read()[:SOURCE_AUDIT_SAMPLE_BYTES]
+            raw_iq, raw_iq_at = get_latest_raw_iq_snapshot()
+            if raw_iq is None:
+                time.sleep(2)
+                continue
             metrics = analyze_raw_signal(raw_iq)
             if metrics is None:
                 time.sleep(5)
@@ -441,7 +452,7 @@ def source_audit_worker():
                 {
                     "type": "source_audit",
                     "node": NODE_NAME,
-                    "timestamp": time.time(),
+                    "timestamp": raw_iq_at or time.time(),
                     "metrics": metrics,
                 },
             )
