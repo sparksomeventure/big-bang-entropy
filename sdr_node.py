@@ -9,6 +9,7 @@ import time
 import uuid
 import urllib.request
 import urllib.parse
+import ssl
 from collections import deque
 
 import iio
@@ -38,7 +39,9 @@ LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
 SDR_TYPE = os.getenv("SDR_TYPE", "pluto").lower()
 RTL_SDR_INDEX = int(os.getenv("RTL_SDR_INDEX", "0"))
 SAMPLE_RATE = float(os.getenv("SAMPLE_RATE", "2.048e6"))
-HTTP_TARGET_PORT = int(os.getenv("HTTP_TARGET_PORT", "8080"))
+HTTP_TARGET_PORT = os.getenv("HTTP_TARGET_PORT", "8080")
+HTTP_TARGET_PROTOCOL = os.getenv("HTTP_TARGET_PROTOCOL", "http")
+HTTP_TARGET_VERIFY_SSL = os.getenv("HTTP_TARGET_VERIFY_SSL", "true").lower() in ("1", "true", "yes")
 
 audit_trigger_event = threading.Event()
 
@@ -488,12 +491,26 @@ def source_audit_worker():
 
 def status_poller_worker():
     safe_node_name = urllib.parse.quote(NODE_NAME)
-    url = f"http://{UDP_TARGET_HOST}:{HTTP_TARGET_PORT}/api/node-status/{safe_node_name}"
-    log(f"[*] Status poller worker active (polling {url} every 60s)")
     
+    # Construct URL. If port is empty, don't append it.
+    if HTTP_TARGET_PORT:
+        url = f"{HTTP_TARGET_PROTOCOL}://{UDP_TARGET_HOST}:{HTTP_TARGET_PORT}/api/node-status/{safe_node_name}"
+    else:
+        url = f"{HTTP_TARGET_PROTOCOL}://{UDP_TARGET_HOST}/api/node-status/{safe_node_name}"
+        
+    log(f"[*] Status poller worker active (polling {url} every 60s, verify_ssl={HTTP_TARGET_VERIFY_SSL})")
+    
+    # Create SSL context if we need to skip verification
+    ctx = None
+    if HTTP_TARGET_PROTOCOL == "https" and not HTTP_TARGET_VERIFY_SSL:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
     while True:
         try:
-            with urllib.request.urlopen(url, timeout=10) as response:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
                 if response.status == 200:
                     data = json.loads(response.read().decode("utf-8"))
                     status = data.get("status")
