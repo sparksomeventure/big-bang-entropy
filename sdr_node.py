@@ -42,6 +42,7 @@ SAMPLE_RATE = float(os.getenv("SAMPLE_RATE", "2.048e6"))
 HTTP_TARGET_PORT = os.getenv("HTTP_TARGET_PORT", "8080")
 HTTP_TARGET_PROTOCOL = os.getenv("HTTP_TARGET_PROTOCOL", "http")
 HTTP_TARGET_VERIFY_SSL = os.getenv("HTTP_TARGET_VERIFY_SSL", "true").lower() in ("1", "true", "yes")
+CONVERTER_MODE = os.getenv("CONVERTER_MODE", "none").strip().lower()
 
 audit_trigger_event = threading.Event()
 
@@ -74,9 +75,26 @@ def getenv_optional_float(name: str):
     return float(value)
 
 
+def getenv_optional_int(name: str):
+    value = os.getenv(name)
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    return int(value)
+
+
 WATERFALL_Y_SPAN_DB = getenv_optional_float("WATERFALL_Y_SPAN_DB")
 WATERFALL_Y_MIN_DB = getenv_optional_float("WATERFALL_Y_MIN_DB")
 WATERFALL_Y_MAX_DB = getenv_optional_float("WATERFALL_Y_MAX_DB")
+CONVERTER_LO_HZ = getenv_optional_int("CONVERTER_LO_HZ")
+CONVERTER_LO_LOW_HZ = int(os.getenv("CONVERTER_LO_LOW_HZ", "9750000000"))
+CONVERTER_LO_HIGH_HZ = int(os.getenv("CONVERTER_LO_HIGH_HZ", "10600000000"))
+CONVERTER_RF_LOW_MIN_HZ = int(os.getenv("CONVERTER_RF_LOW_MIN_HZ", "10700000000"))
+CONVERTER_RF_LOW_MAX_HZ = int(os.getenv("CONVERTER_RF_LOW_MAX_HZ", "11700000000"))
+CONVERTER_RF_HIGH_MIN_HZ = int(os.getenv("CONVERTER_RF_HIGH_MIN_HZ", "11700000000"))
+CONVERTER_RF_HIGH_MAX_HZ = int(os.getenv("CONVERTER_RF_HIGH_MAX_HZ", "12750000000"))
 
 THEME_BG = "#020202"
 THEME_PRIMARY = "#05B6D4"
@@ -98,6 +116,72 @@ def log(message: str):
     print(message, flush=True)
 
 
+def resolve_radio_frequencies():
+    mode = CONVERTER_MODE or "none"
+    rf_freq_hz = FREQ
+
+    if mode == "none":
+        return {
+            "mode": "none",
+            "rf_freq_hz": rf_freq_hz,
+            "tuner_freq_hz": rf_freq_hz,
+            "display_freq_hz": rf_freq_hz,
+            "converter_lo_hz": None,
+            "converter_path": "direct",
+        }
+
+    if mode == "up":
+        if CONVERTER_LO_HZ is None or CONVERTER_LO_HZ <= 0:
+            raise ValueError("CONVERTER_LO_HZ must be set for CONVERTER_MODE=up")
+        return {
+            "mode": "up",
+            "rf_freq_hz": rf_freq_hz,
+            "tuner_freq_hz": rf_freq_hz + CONVERTER_LO_HZ,
+            "display_freq_hz": rf_freq_hz,
+            "converter_lo_hz": CONVERTER_LO_HZ,
+            "converter_path": "upconverter",
+        }
+
+    if mode == "down":
+        selected_lo_hz = CONVERTER_LO_HZ
+        converter_path = "downconverter-manual"
+
+        if selected_lo_hz is None:
+            if CONVERTER_RF_LOW_MIN_HZ <= rf_freq_hz < CONVERTER_RF_LOW_MAX_HZ:
+                selected_lo_hz = CONVERTER_LO_LOW_HZ
+                converter_path = "downconverter-low-band"
+            elif CONVERTER_RF_HIGH_MIN_HZ <= rf_freq_hz <= CONVERTER_RF_HIGH_MAX_HZ:
+                selected_lo_hz = CONVERTER_LO_HIGH_HZ
+                converter_path = "downconverter-high-band"
+            else:
+                raise ValueError(
+                    f"FREQ={rf_freq_hz} Hz is outside configured downconverter RF ranges "
+                    f"({CONVERTER_RF_LOW_MIN_HZ}-{CONVERTER_RF_LOW_MAX_HZ - 1} / "
+                    f"{CONVERTER_RF_HIGH_MIN_HZ}-{CONVERTER_RF_HIGH_MAX_HZ})"
+                )
+
+        tuner_freq_hz = abs(rf_freq_hz - selected_lo_hz)
+        if tuner_freq_hz <= 0:
+            raise ValueError(
+                f"Computed downconverter IF is invalid for FREQ={rf_freq_hz} Hz and LO={selected_lo_hz} Hz"
+            )
+        return {
+            "mode": "down",
+            "rf_freq_hz": rf_freq_hz,
+            "tuner_freq_hz": tuner_freq_hz,
+            "display_freq_hz": rf_freq_hz,
+            "converter_lo_hz": selected_lo_hz,
+            "converter_path": converter_path,
+        }
+
+    raise ValueError(f"Unsupported CONVERTER_MODE={CONVERTER_MODE!r}. Use none, down, or up.")
+
+
+RADIO_FREQ_PLAN = resolve_radio_frequencies()
+TUNER_FREQ_HZ = RADIO_FREQ_PLAN["tuner_freq_hz"]
+DISPLAY_FREQ_HZ = RADIO_FREQ_PLAN["display_freq_hz"]
+
+
 def build_iio_context():
     if not PLUTO_IP or PLUTO_IP.lower() in ("local", "usb", "auto"):
         log("[*] Searching for local/USB IIO context (auto-discovery)...")
@@ -114,7 +198,7 @@ def build_iio_context():
 
 def configure_radio(ctx):
     phy = ctx.find_device("ad9361-phy")
-    phy.find_channel("altvoltage0", True).attrs["frequency"].value = str(FREQ)
+    phy.find_channel("altvoltage0", True).attrs["frequency"].value = str(TUNER_FREQ_HZ)
     rx = phy.find_channel(RX_CHANNEL)
     rx.attrs["gain_control_mode"].value = "manual"
     rx.attrs["hardwaregain"].value = str(GAIN)
@@ -304,7 +388,7 @@ def waterfall_sender_worker():
             psd_db = 10 * np.log10(psd + 1e-9)
             freqs = np.fft.fftshift(np.fft.fftfreq(len(iq_complex), d=1 / 2.084e6)) / 1e6
 
-            x = freqs + (FREQ / 1e6)
+            x = freqs + (DISPLAY_FREQ_HZ / 1e6)
             y = psd_db
             waterfall_history.append(y.copy())
             history_frames = list(waterfall_history)
@@ -377,7 +461,7 @@ def waterfall_sender_worker():
             ax.scatter(x[::64], y[::64], s=6, c=THEME_ACCENT, alpha=0.35, linewidths=0, zorder=5)
 
             ax.set_title(
-                f"Node {NODE_NAME} - Cosmic Noise @ {FREQ / 1e6:.3f} MHz",
+                f"Node {NODE_NAME} - Cosmic Noise @ {DISPLAY_FREQ_HZ / 1e6:.3f} MHz",
                 color=THEME_PRIMARY,
                 fontsize=12,
                 pad=12,
@@ -571,6 +655,17 @@ if __name__ == "__main__":
         f"[*] SDR node {NODE_NAME} starting. Target: "
         f"{UDP_TARGET_HOST}:{UDP_TARGET_PORT}, Source: Pluto {PLUTO_IP}"
     )
+    log(
+        f"[*] Frequency plan: mode={RADIO_FREQ_PLAN['mode']}, "
+        f"path={RADIO_FREQ_PLAN['converter_path']}, "
+        f"rf={RADIO_FREQ_PLAN['rf_freq_hz'] / 1e6:.3f} MHz, "
+        f"tuner={RADIO_FREQ_PLAN['tuner_freq_hz'] / 1e6:.3f} MHz"
+        + (
+            f", lo={RADIO_FREQ_PLAN['converter_lo_hz'] / 1e6:.3f} MHz"
+            if RADIO_FREQ_PLAN["converter_lo_hz"] is not None
+            else ""
+        )
+    )
 
     # Give Pluto a moment to breathe after previous container restart
     time.sleep(5)
@@ -588,7 +683,7 @@ if __name__ == "__main__":
                 from rtlsdr import RtlSdr
                 sdr_obj = RtlSdr(device_index=RTL_SDR_INDEX)
                 sdr_obj.sample_rate = SAMPLE_RATE
-                sdr_obj.center_freq = FREQ
+                sdr_obj.center_freq = TUNER_FREQ_HZ
                 sdr_obj.gain = GAIN
                 sdr_source = sdr_obj
                 log(f"[*] RTL-SDR successfully initialized: {sdr_obj}")
