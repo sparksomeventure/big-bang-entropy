@@ -713,16 +713,15 @@ app.wsgi_app = ProxyFix(
 @app.route("/healthz")
 def healthz():
     _cleanup_stale_nodes()
+    sources_snapshot = _snapshot_sources()
     with pool_lock:
         pool_bytes = len(entropy_pool)
     with waterfalls_lock:
         node_count = len(waterfalls)
-    with node_stats_lock:
-        source_nodes = len(node_stats)
-    with source_audits_lock:
-        rejecting_nodes = sum(
-            1 for audit in source_audits.values() if not _source_audit_summary(audit)["accepting_samples"]
-        )
+    source_nodes = len(sources_snapshot)
+    rejecting_nodes = sum(
+        1 for source in sources_snapshot if not source.get("accepting_samples", True)
+    )
     return jsonify(
         {
             "status": "ok",
