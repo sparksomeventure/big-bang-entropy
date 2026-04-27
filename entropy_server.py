@@ -801,6 +801,34 @@ def list_waterfalls():
     return jsonify(payload)
 
 
+@app.route("/api/node-status/<node_name>")
+def get_node_status(node_name: str):
+    _cleanup_stale_nodes()
+    now = time.time()
+    
+    with source_audits_lock:
+        audit_info = source_audits.get(node_name)
+        
+    summary = _source_audit_summary(audit_info, now=now)
+    
+    with node_stats_lock:
+        stats = node_stats.get(node_name, {})
+        last_seen = stats.get("last_seen", 0.0)
+        rejected_packets = stats.get("rejected_packets", 0)
+
+    return jsonify({
+        "node": node_name,
+        "status": summary["status"],
+        "accepting_samples": summary["accepting_samples"],
+        "repeat_score": summary["repeat_score"],
+        "repeat_score_threshold": SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD,
+        "age_sec": summary["age_sec"],
+        "max_age_sec": SOURCE_AUDIT_MAX_AGE_SEC,
+        "last_seen_age_sec": round(now - last_seen, 1) if last_seen else None,
+        "rejected_packets": rejected_packets
+    })
+
+
 @app.route("/sources")
 def list_sources():
     return jsonify(_snapshot_sources())

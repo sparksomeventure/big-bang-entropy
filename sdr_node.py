@@ -7,6 +7,8 @@ import socket
 import threading
 import time
 import uuid
+import urllib.request
+import urllib.parse
 from collections import deque
 
 import iio
@@ -36,6 +38,9 @@ LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
 SDR_TYPE = os.getenv("SDR_TYPE", "pluto").lower()
 RTL_SDR_INDEX = int(os.getenv("RTL_SDR_INDEX", "0"))
 SAMPLE_RATE = float(os.getenv("SAMPLE_RATE", "2.048e6"))
+HTTP_TARGET_PORT = int(os.getenv("HTTP_TARGET_PORT", "8080"))
+
+audit_trigger_event = threading.Event()
 
 runtime_stats = {
     "sample_packets_sent": 0,
@@ -445,6 +450,12 @@ def source_audit_worker():
 
     while True:
         try:
+            # Wait for event or interval
+            triggered = audit_trigger_event.wait(timeout=max(1, SOURCE_AUDIT_INTERVAL_SEC))
+            if triggered:
+                log("[*] Source audit triggered by status poller (STALE or WARN status).")
+                audit_trigger_event.clear()
+
             raw_iq, raw_iq_at = get_latest_raw_iq_snapshot()
             if raw_iq is None:
                 time.sleep(2)
@@ -470,10 +481,38 @@ def source_audit_worker():
                 f"[*] Source audit sent (node={NODE_NAME}, repeat_score={metrics['repeat_score']}, "
                 f"spectral_flatness={metrics['spectral_flatness']})"
             )
-            time.sleep(max(1, SOURCE_AUDIT_INTERVAL_SEC))
         except Exception as exc:
             log(f"[!] Source audit error: {exc}")
             time.sleep(5)
+
+
+def status_poller_worker():
+    safe_node_name = urllib.parse.quote(NODE_NAME)
+    url = f"http://{UDP_TARGET_HOST}:{HTTP_TARGET_PORT}/api/node-status/{safe_node_name}"
+    log(f"[*] Status poller worker active (polling {url} every 60s)")
+    
+    while True:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode("utf-8"))
+                    status = data.get("status")
+                    accepting = data.get("accepting_samples", True)
+                    
+                    if not accepting or status in ("STALE", "WARN"):
+                        log(f"[!] Generator status: {status} (accepting={accepting}). Requesting fresh audit...")
+                        audit_trigger_event.set()
+                    elif status == "OK":
+                        # All good
+                        pass
+                else:
+                    log(f"[!] Status poller: Unexpected response {response.status}")
+        except Exception as exc:
+            # This is expected if generator is down or network issues
+            # log(f"[!] Status poller error: {exc}")
+            pass
+        
+        time.sleep(60)
 
 
 def stats_logger_worker():
@@ -555,6 +594,7 @@ if __name__ == "__main__":
     threading.Thread(target=entropy_sender_worker, args=(sdr_source,), daemon=True).start()
     threading.Thread(target=waterfall_sender_worker, daemon=True).start()
     threading.Thread(target=source_audit_worker, daemon=True).start()
+    threading.Thread(target=status_poller_worker, daemon=True).start()
     threading.Thread(target=stats_logger_worker, daemon=True).start()
 
     while True:
