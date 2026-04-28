@@ -61,9 +61,11 @@ stats_lock = threading.Lock()
 latest_raw_iq = None
 latest_raw_iq_at = 0.0
 latest_raw_iq_lock = threading.Lock()
+latest_raw_iq_error_logged = False
 waterfall_history = deque(maxlen=max(1, WATERFALL_HISTORY_FRAMES))
 axis_window_frames = max(2, int(math.ceil(max(1, WATERFALL_AXIS_WINDOW_SEC) / max(1, WATERFALL_INTERVAL_SEC))))
 waterfall_axis_metrics = deque(maxlen=axis_window_frames)
+MAX_SHARED_RAW_IQ_AGE_SEC = max(10, WATERFALL_INTERVAL_SEC * 3)
 
 
 def getenv_optional_float(name: str):
@@ -115,6 +117,13 @@ WATERFALL_LINE_CMAP = LinearSegmentedColormap.from_list(
 
 def log(message: str):
     print(message, flush=True)
+
+
+class SDRSourceHandle:
+    def __init__(self, source, ctx=None, dev=None):
+        self.source = source
+        self.ctx = ctx
+        self.dev = dev
 
 
 def get_display_frequency_axis():
@@ -269,10 +278,64 @@ def update_latest_raw_iq(raw_iq: bytes):
 
 
 def get_latest_raw_iq_snapshot():
+    global latest_raw_iq_error_logged
     with latest_raw_iq_lock:
         if latest_raw_iq is None:
             return None, 0.0
+        sample_age = time.time() - latest_raw_iq_at
+        if sample_age > MAX_SHARED_RAW_IQ_AGE_SEC:
+            if not latest_raw_iq_error_logged:
+                log(
+                    f"[!] Shared raw IQ is stale ({sample_age:.1f}s old). "
+                    "Waiting for fresh SDR samples before sending waterfall/audit."
+                )
+                latest_raw_iq_error_logged = True
+            return None, latest_raw_iq_at
+        latest_raw_iq_error_logged = False
         return latest_raw_iq, latest_raw_iq_at
+
+
+def cleanup_sdr_source(source):
+    if source is None:
+        return
+    source_obj = source.source if isinstance(source, SDRSourceHandle) else source
+    for method_name in ("cancel", "close", "destroy"):
+        method = getattr(source_obj, method_name, None)
+        if callable(method):
+            try:
+                method()
+            except Exception:
+                pass
+
+
+def initialize_sdr_source():
+    if SDR_TYPE == "rtlsdr":
+        from rtlsdr import RtlSdr
+        sdr_obj = RtlSdr(device_index=RTL_SDR_INDEX)
+        sdr_obj.sample_rate = SAMPLE_RATE
+        sdr_obj.center_freq = TUNER_FREQ_HZ
+        sdr_obj.gain = GAIN
+        log(f"[*] RTL-SDR successfully initialized: {sdr_obj}")
+        return SDRSourceHandle(sdr_obj)
+
+    sdr_ctx = build_iio_context()
+    sdr_dev = configure_radio(sdr_ctx)
+    sdr_buffer = iio.Buffer(sdr_dev, 32768)
+    log(f"[*] PlutoSDR successfully initialized. Context: {sdr_ctx.name}")
+    return SDRSourceHandle(sdr_buffer, ctx=sdr_ctx, dev=sdr_dev)
+
+
+def reconnect_sdr_source(previous_source, reason):
+    cleanup_sdr_source(previous_source)
+    for attempt in range(1, 11):
+        try:
+            log(f"[!] Reinitializing SDR after streaming failure ({reason}), attempt {attempt}/10...")
+            return initialize_sdr_source()
+        except Exception as exc:
+            log(f"[!] SDR reinit attempt {attempt}/10 failed: {exc}")
+            time.sleep(min(30, attempt * 2))
+    log("[!] Fatal: Could not recover SDR stream after repeated reinit failures. Exiting.")
+    os._exit(1)
 
 
 def entropy_sender_worker(source):
@@ -285,11 +348,11 @@ def entropy_sender_worker(source):
         try:
             if SDR_TYPE == "rtlsdr":
                 # read_bytes(n) returns bytes/bytearray for RTL-SDR
-                raw_data = source.read_bytes(65536)
+                raw_data = source.source.read_bytes(65536)
             else:
                 # buffer.refill() for PlutoSDR
-                source.refill()
-                raw_data = source.read()
+                source.source.refill()
+                raw_data = source.source.read()
 
             update_latest_raw_iq(raw_data)
 
@@ -365,7 +428,9 @@ def entropy_sender_worker(source):
                     runtime_stats["last_sample_at"] = time.time()
         except Exception as exc:
             log(f"[!] SDR streaming error: {exc}")
-            time.sleep(2)
+            entropy_accumulator.clear()
+            source = reconnect_sdr_source(source, str(exc))
+            time.sleep(1)
 
 
 def waterfall_sender_worker():
@@ -682,30 +747,12 @@ if __name__ == "__main__":
     # Give Pluto a moment to breathe after previous container restart
     time.sleep(5)
 
-    sdr_ctx = None
-    sdr_dev = None
-    sdr_buffer = None
-
     # Main initialization loop - process won't start workers until hardware is ready
     sdr_source = None
     for attempt in range(1, 11):
         try:
             log(f"[*] SDR init attempt {attempt}/10 (Type: {SDR_TYPE})...")
-            if SDR_TYPE == "rtlsdr":
-                from rtlsdr import RtlSdr
-                sdr_obj = RtlSdr(device_index=RTL_SDR_INDEX)
-                sdr_obj.sample_rate = SAMPLE_RATE
-                sdr_obj.center_freq = TUNER_FREQ_HZ
-                sdr_obj.gain = GAIN
-                sdr_source = sdr_obj
-                log(f"[*] RTL-SDR successfully initialized: {sdr_obj}")
-            else:
-                sdr_ctx = build_iio_context()
-                sdr_dev = configure_radio(sdr_ctx)
-                # 32768 samples = 128KB (safe middle ground)
-                sdr_buffer = iio.Buffer(sdr_dev, 32768)
-                sdr_source = sdr_buffer
-                log(f"[*] PlutoSDR successfully initialized. Context: {sdr_ctx.name}")
+            sdr_source = initialize_sdr_source()
             break
         except Exception as exc:
             log(f"[!] SDR init failed: {exc}")
