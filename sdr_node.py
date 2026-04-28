@@ -199,9 +199,13 @@ DISPLAY_FREQ_HZ = RADIO_FREQ_PLAN["display_freq_hz"]
 
 
 def build_iio_context():
-    if not PLUTO_IP or PLUTO_IP.lower() in ("local", "usb", "auto"):
+    if not PLUTO_IP or PLUTO_IP.lower() in ("local", "auto"):
         log("[*] Searching for local/USB IIO context (auto-discovery)...")
         return iio.Context()
+
+    if PLUTO_IP.lower() == "usb":
+        log("[*] Attempting to connect to IIO context: usb:")
+        return iio.Context("usb:")
 
     uri = PLUTO_IP
     if ":" not in uri:
@@ -216,6 +220,7 @@ def configure_radio(ctx):
     phy = ctx.find_device("ad9361-phy")
     phy.find_channel("altvoltage0", True).attrs["frequency"].value = str(TUNER_FREQ_HZ)
     rx = phy.find_channel(RX_CHANNEL)
+    rx.attrs["sampling_frequency"].value = str(int(SAMPLE_RATE))
     rx.attrs["gain_control_mode"].value = "manual"
     rx.attrs["hardwaregain"].value = str(GAIN)
 
