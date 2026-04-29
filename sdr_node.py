@@ -41,6 +41,9 @@ LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
 SDR_TYPE = os.getenv("SDR_TYPE", "pluto").lower()
 RTL_SDR_INDEX = int(os.getenv("RTL_SDR_INDEX", "0"))
 SAMPLE_RATE = float(os.getenv("SAMPLE_RATE", "2.048e6"))
+PLUTO_BUFFER_SAMPLES = int(os.getenv("PLUTO_BUFFER_SAMPLES", "65536"))
+RTL_READ_BYTES = int(os.getenv("RTL_READ_BYTES", "262144"))
+ENTROPY_DECIMATION_FACTOR = max(1, int(os.getenv("ENTROPY_DECIMATION_FACTOR", "4")))
 HTTP_TARGET_PORT = os.getenv("HTTP_TARGET_PORT", "8080")
 HTTP_TARGET_PROTOCOL = os.getenv("HTTP_TARGET_PROTOCOL", "http")
 HTTP_TARGET_VERIFY_SSL = os.getenv("HTTP_TARGET_VERIFY_SSL", "true").lower() in ("1", "true", "yes")
@@ -457,9 +460,17 @@ def initialize_sdr_source():
 
     sdr_ctx = build_iio_context()
     sdr_dev = configure_radio(sdr_ctx)
-    sdr_buffer = iio.Buffer(sdr_dev, 32768)
+    sdr_buffer = iio.Buffer(sdr_dev, PLUTO_BUFFER_SAMPLES)
     log(f"[*] PlutoSDR successfully initialized. Context: {sdr_ctx.name}")
     return SDRSourceHandle(sdr_buffer, ctx=sdr_ctx, dev=sdr_dev)
+
+
+def has_repetition_run(bits: np.ndarray, max_run_length: int) -> bool:
+    if bits.size < max_run_length:
+        return False
+    change_points = np.flatnonzero(np.diff(bits)) + 1
+    run_lengths = np.diff(np.concatenate(([0], change_points, [bits.size])))
+    return bool(run_lengths.max(initial=0) >= max_run_length)
 
 
 def reconnect_sdr_source(previous_source, reason):
@@ -485,7 +496,7 @@ def entropy_sender_worker(source):
         try:
             if SDR_TYPE == "rtlsdr":
                 # read_bytes(n) returns bytes/bytearray for RTL-SDR
-                raw_data = source.source.read_bytes(65536)
+                raw_data = source.source.read_bytes(RTL_READ_BYTES)
             else:
                 # buffer.refill() for PlutoSDR
                 source.source.refill()
@@ -498,19 +509,18 @@ def entropy_sender_worker(source):
             dtype = np.uint8 if SDR_TYPE == "rtlsdr" else np.int16
             # Ensure we have a multiple of sample size (2 bytes for RTL, 4 for Pluto)
             limit = len(raw_data) - (len(raw_data) % (2 if SDR_TYPE == "rtlsdr" else 4))
-            samples = np.frombuffer(raw_data[:limit], dtype=dtype).astype(np.int16)
+            samples = np.frombuffer(raw_data[:limit], dtype=dtype)
 
-            # 2. Light decimation [::4] – PlutoSDR AD9361 auto-correlation drops
-            #    within 3-4 samples (Nyquist oversampling), so [::37] was wasting
-            #    ~89% of perfectly good noise. [::4] still guarantees independence.
-            decimated = samples[::4]
+            # 2. Light decimation – configurable so weak nodes can be tuned
+            #    conservatively without touching the extractor implementation.
+            decimated = samples[::ENTROPY_DECIMATION_FACTOR]
 
             # 3. Multi-bit XOR fold: combine LSB (bit0) and next noise bit (bit1)
             #    via XOR. XOR of two weakly-biased independent bits produces a bit
             #    closer to 0.5 bias, effectively a cheap pre-whitening step.
             #    Result is half the samples as independent noise bits.
-            lsb0 = (decimated & np.int16(1)).astype(np.uint8)
-            lsb1 = ((decimated >> 1) & np.int16(1)).astype(np.uint8)
+            lsb0 = np.bitwise_and(decimated, 1).astype(np.uint8, copy=False)
+            lsb1 = np.bitwise_and(np.right_shift(decimated, 1), 1).astype(np.uint8, copy=False)
             bits = lsb0 ^ lsb1
 
             # 4. Von Neumann Extractor (mandatory – removes any residual DC bias)
@@ -523,9 +533,7 @@ def entropy_sender_worker(source):
             # 5. FIPS 140-3 Health Checks (RCT & APT)
             # RCT: Repetition Count Test (checks for stuck bits / constant output)
             if len(extracted_bits) > 32:
-                # Check for long runs of the same bit
-                bit_str = "".join(extracted_bits.astype(str))
-                if "0" * 32 in bit_str or "1" * 32 in bit_str:
+                if has_repetition_run(extracted_bits, 32):
                     log("[!] Health Check Failed: RCT (long run detected). Dropping packet.")
                     continue
 
@@ -543,8 +551,9 @@ def entropy_sender_worker(source):
             entropy_accumulator.extend(extracted_bytes)
             # ------------------------------------------------------------------
 
-            # Send in 1 KB chunks to generator
-            chunk_target = 1024
+            # Respect configured packet size to avoid wasting throughput on
+            # base64+JSON+UDP overhead per tiny payload.
+            chunk_target = max(256, SAMPLE_PACKET_BYTES)
             while len(entropy_accumulator) >= chunk_target:
                 chunk = bytes(entropy_accumulator[:chunk_target])
                 del entropy_accumulator[:chunk_target]
