@@ -1,4 +1,5 @@
 import base64
+import ctypes
 import io
 import json
 import math
@@ -124,6 +125,137 @@ class SDRSourceHandle:
         self.source = source
         self.ctx = ctx
         self.dev = dev
+
+
+class CompatRtlSdr:
+    _library = None
+
+    def __init__(self, device_index=0):
+        self.device_index = int(device_index)
+        self._dev = ctypes.c_void_p()
+        self._sample_rate = 0
+        self._center_freq = 0
+        self._gain = None
+        lib = self._get_library()
+        result = lib.rtlsdr_open(ctypes.byref(self._dev), self.device_index)
+        if result != 0:
+            raise RuntimeError(f"rtlsdr_open(index={self.device_index}) failed with code {result}")
+
+    @classmethod
+    def _get_library(cls):
+        if cls._library is not None:
+            return cls._library
+
+        lib = ctypes.CDLL("librtlsdr.so")
+        lib.rtlsdr_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32]
+        lib.rtlsdr_open.restype = ctypes.c_int
+        lib.rtlsdr_close.argtypes = [ctypes.c_void_p]
+        lib.rtlsdr_close.restype = ctypes.c_int
+        lib.rtlsdr_set_center_freq.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        lib.rtlsdr_set_center_freq.restype = ctypes.c_int
+        lib.rtlsdr_set_sample_rate.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        lib.rtlsdr_set_sample_rate.restype = ctypes.c_int
+        lib.rtlsdr_set_tuner_gain_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.rtlsdr_set_tuner_gain_mode.restype = ctypes.c_int
+        lib.rtlsdr_set_tuner_gain.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.rtlsdr_set_tuner_gain.restype = ctypes.c_int
+        lib.rtlsdr_reset_buffer.argtypes = [ctypes.c_void_p]
+        lib.rtlsdr_reset_buffer.restype = ctypes.c_int
+        lib.rtlsdr_read_sync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.rtlsdr_read_sync.restype = ctypes.c_int
+        cls._library = lib
+        return lib
+
+    def _require_ok(self, result, operation):
+        if result != 0:
+            raise RuntimeError(f"{operation} failed with code {result}")
+
+    @property
+    def sample_rate(self):
+        return self._sample_rate
+
+    @sample_rate.setter
+    def sample_rate(self, value):
+        value = int(float(value))
+        self._require_ok(
+            self._get_library().rtlsdr_set_sample_rate(self._dev, value),
+            f"rtlsdr_set_sample_rate({value})",
+        )
+        self._sample_rate = value
+
+    @property
+    def center_freq(self):
+        return self._center_freq
+
+    @center_freq.setter
+    def center_freq(self, value):
+        value = int(float(value))
+        self._require_ok(
+            self._get_library().rtlsdr_set_center_freq(self._dev, value),
+            f"rtlsdr_set_center_freq({value})",
+        )
+        self._center_freq = value
+
+    @property
+    def gain(self):
+        return self._gain
+
+    @gain.setter
+    def gain(self, value):
+        lib = self._get_library()
+        if value in (None, "auto"):
+            self._require_ok(lib.rtlsdr_set_tuner_gain_mode(self._dev, 0), "rtlsdr_set_tuner_gain_mode(auto)")
+            self._gain = value
+            return
+
+        gain_db = float(value)
+        gain_tenths_db = int(round(gain_db * 10))
+        self._require_ok(lib.rtlsdr_set_tuner_gain_mode(self._dev, 1), "rtlsdr_set_tuner_gain_mode(manual)")
+        self._require_ok(
+            lib.rtlsdr_set_tuner_gain(self._dev, gain_tenths_db),
+            f"rtlsdr_set_tuner_gain({gain_tenths_db})",
+        )
+        self._gain = gain_db
+
+    def read_bytes(self, num_bytes):
+        num_bytes = int(num_bytes)
+        if num_bytes <= 0:
+            return b""
+
+        lib = self._get_library()
+        buffer = ctypes.create_string_buffer(num_bytes)
+        bytes_read = ctypes.c_int()
+        self._require_ok(
+            lib.rtlsdr_read_sync(self._dev, buffer, num_bytes, ctypes.byref(bytes_read)),
+            f"rtlsdr_read_sync({num_bytes})",
+        )
+        return buffer.raw[: bytes_read.value]
+
+    def reset_buffer(self):
+        self._require_ok(self._get_library().rtlsdr_reset_buffer(self._dev), "rtlsdr_reset_buffer")
+
+    def cancel(self):
+        return None
+
+    def close(self):
+        if not self._dev:
+            return
+        try:
+            self._require_ok(self._get_library().rtlsdr_close(self._dev), "rtlsdr_close")
+        finally:
+            self._dev = ctypes.c_void_p()
+
+    def __repr__(self):
+        gain_repr = "auto" if self._gain in (None, "auto") else f"{self._gain:.1f} dB"
+        return (
+            f"CompatRtlSdr(index={self.device_index}, "
+            f"sample_rate={self._sample_rate}, center_freq={self._center_freq}, gain={gain_repr})"
+        )
 
 
 def get_display_frequency_axis():
@@ -315,11 +447,11 @@ def cleanup_sdr_source(source):
 
 def initialize_sdr_source():
     if SDR_TYPE == "rtlsdr":
-        from rtlsdr import RtlSdr
-        sdr_obj = RtlSdr(device_index=RTL_SDR_INDEX)
+        sdr_obj = CompatRtlSdr(device_index=RTL_SDR_INDEX)
         sdr_obj.sample_rate = SAMPLE_RATE
         sdr_obj.center_freq = TUNER_FREQ_HZ
         sdr_obj.gain = GAIN
+        sdr_obj.reset_buffer()
         log(f"[*] RTL-SDR successfully initialized: {sdr_obj}")
         return SDRSourceHandle(sdr_obj)
 
