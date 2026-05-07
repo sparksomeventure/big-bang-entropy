@@ -41,7 +41,7 @@ LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
 SDR_TYPE = os.getenv("SDR_TYPE", "pluto").lower()
 RTL_SDR_INDEX = int(os.getenv("RTL_SDR_INDEX", "0"))
 SAMPLE_RATE = float(os.getenv("SAMPLE_RATE", "2.048e6"))
-PLUTO_BUFFER_SAMPLES = int(os.getenv("PLUTO_BUFFER_SAMPLES", "65536"))
+PLUTO_BUFFER_SAMPLES = int(os.getenv("PLUTO_BUFFER_SAMPLES", "32768"))
 RTL_READ_BYTES = int(os.getenv("RTL_READ_BYTES", "262144"))
 ENTROPY_DECIMATION_FACTOR = max(1, int(os.getenv("ENTROPY_DECIMATION_FACTOR", "4")))
 HTTP_TARGET_PORT = os.getenv("HTTP_TARGET_PORT", "8080")
@@ -70,6 +70,7 @@ waterfall_history = deque(maxlen=max(1, WATERFALL_HISTORY_FRAMES))
 axis_window_frames = max(2, int(math.ceil(max(1, WATERFALL_AXIS_WINDOW_SEC) / max(1, WATERFALL_INTERVAL_SEC))))
 waterfall_axis_metrics = deque(maxlen=axis_window_frames)
 MAX_SHARED_RAW_IQ_AGE_SEC = max(10, WATERFALL_INTERVAL_SEC * 3)
+MAX_SAFE_SAMPLE_PACKET_BYTES = 48000
 
 
 def getenv_optional_float(name: str):
@@ -121,6 +122,16 @@ WATERFALL_LINE_CMAP = LinearSegmentedColormap.from_list(
 
 def log(message: str):
     print(message, flush=True)
+
+
+def effective_sample_packet_bytes() -> int:
+    requested = max(256, int(SAMPLE_PACKET_BYTES))
+    if requested > MAX_SAFE_SAMPLE_PACKET_BYTES:
+        log(
+            f"[!] SAMPLE_PACKET_BYTES={requested} is too large for JSON+base64 over one UDP datagram. "
+            f"Clamping to {MAX_SAFE_SAMPLE_PACKET_BYTES}."
+        )
+    return min(requested, MAX_SAFE_SAMPLE_PACKET_BYTES)
 
 
 class SDRSourceHandle:
@@ -460,6 +471,11 @@ def initialize_sdr_source():
 
     sdr_ctx = build_iio_context()
     sdr_dev = configure_radio(sdr_ctx)
+    if PLUTO_BUFFER_SAMPLES > 32768:
+        log(
+            f"[!] PLUTO_BUFFER_SAMPLES={PLUTO_BUFFER_SAMPLES} may be unstable with libiio/Pluto transport. "
+            "If you see '[Errno 90] Message too long', try 32768."
+        )
     sdr_buffer = iio.Buffer(sdr_dev, PLUTO_BUFFER_SAMPLES)
     log(f"[*] PlutoSDR successfully initialized. Context: {sdr_ctx.name}")
     return SDRSourceHandle(sdr_buffer, ctx=sdr_ctx, dev=sdr_dev)
@@ -489,8 +505,12 @@ def reconnect_sdr_source(previous_source, reason):
 def entropy_sender_worker(source):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     entropy_accumulator = bytearray()
+    chunk_target = effective_sample_packet_bytes()
 
-    log(f"[*] Entropy sender worker active (node={NODE_NAME}, type={SDR_TYPE})")
+    log(
+        f"[*] Entropy sender worker active (node={NODE_NAME}, type={SDR_TYPE}, "
+        f"sample_packet_bytes={chunk_target}, decimation={ENTROPY_DECIMATION_FACTOR})"
+    )
 
     while True:
         try:
@@ -553,7 +573,6 @@ def entropy_sender_worker(source):
 
             # Respect configured packet size to avoid wasting throughput on
             # base64+JSON+UDP overhead per tiny payload.
-            chunk_target = max(256, SAMPLE_PACKET_BYTES)
             while len(entropy_accumulator) >= chunk_target:
                 chunk = bytes(entropy_accumulator[:chunk_target])
                 del entropy_accumulator[:chunk_target]

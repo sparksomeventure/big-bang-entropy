@@ -135,6 +135,258 @@ Common generator endpoints:
 - `/source-audits` - latest raw-signal audits reported by SDR nodes
 - `/waterfalls` - available waterfall frames
 
+## Service Model
+
+Big Bang Entropy can be consumed in three different ways:
+
+- Public API: free, no account, no API key, intended for experiments, integration tests, prototypes, and lightweight usage
+- Self-hosted open-source stack: deploy the generator, SDR node, audit, and nginx components in your own infrastructure
+- Dedicated deployment: for higher throughput, isolated infrastructure, private networking, or deployment support
+
+The public API should be treated as a best-effort service rather than a formally guaranteed commercial SLA endpoint.
+
+## Quick Start In 30 Seconds
+
+Check the current public service state:
+
+```bash
+curl https://entropy.sparksome.pl/healthz
+```
+
+Download one raw entropy chunk:
+
+```bash
+curl https://entropy.sparksome.pl/raw --output entropy.bin
+```
+
+Try a ready-to-use JSON endpoint:
+
+```bash
+curl "https://entropy.sparksome.pl/api/password?length=24&count=3"
+```
+
+## Public API Reference
+
+### Base URL
+
+```text
+https://entropy.sparksome.pl
+```
+
+### Authentication
+
+No account and no API key are required for the public service.
+
+### Output formats
+
+- Raw entropy endpoints return `application/octet-stream`
+- Diagnostic and generator endpoints return JSON
+- Waterfall image endpoints return `image/png` or `image/webp`
+
+### Core entropy endpoints
+
+#### `GET /raw`
+
+Returns a single binary chunk of raw entropy.
+
+- Response: `200 OK` with `application/octet-stream`
+- Warm-up behavior: `503 Warming up...` when the public pool is not ready
+- Chunk size: controlled by server configuration, currently exposed by `/healthz` as `raw_http_chunk`
+
+Example:
+
+```bash
+curl https://entropy.sparksome.pl/raw --output entropy.bin
+```
+
+#### `GET /raw/stream?bytes=<n>`
+
+Streams up to the requested number of bytes from the public pool.
+
+- Query parameter: `bytes` optional, positive integer
+- Default request size: `STREAM_CHUNK_BYTES * 16`, exposed operationally on the service
+- Response: `200 OK` with streamed `application/octet-stream`
+- Partial delivery is possible when the pool is still warming up or temporarily low
+
+Example:
+
+```bash
+curl "https://entropy.sparksome.pl/raw/stream?bytes=1048576" --output 1mb.bin
+```
+
+#### `GET /download/entropy?bytes=<n>`
+
+Same entropy stream as `/raw/stream`, but returned with a download-oriented filename header.
+
+- Query parameter: `bytes` optional, positive integer
+- Response header: `Content-Disposition: attachment; filename="entropy-<timestamp>.bin"`
+- Response header: `X-Entropy-Requested-Bytes`
+
+Example:
+
+```bash
+curl -OJ "https://entropy.sparksome.pl/download/entropy?bytes=65536"
+```
+
+### Diagnostics and monitoring endpoints
+
+#### `GET /healthz`
+
+Returns the current high-level status of the public service, including:
+
+- pool size in bytes
+- pool fill percentage
+- configured public chunk sizes
+- TCP session size
+- active SDR source counts
+- source-audit thresholds
+
+Example:
+
+```bash
+curl https://entropy.sparksome.pl/healthz
+```
+
+#### `GET /sources`
+
+Returns the current snapshot of source nodes and their latest activity and audit state.
+
+Example:
+
+```bash
+curl https://entropy.sparksome.pl/sources
+```
+
+#### `GET /source-audits`
+
+Returns the latest raw-signal audit payloads reported by SDR nodes.
+
+Example:
+
+```bash
+curl https://entropy.sparksome.pl/source-audits
+```
+
+#### `GET /waterfalls`
+
+Returns a JSON list of available waterfall previews and frame metadata.
+
+Example:
+
+```bash
+curl https://entropy.sparksome.pl/waterfalls
+```
+
+#### `GET /waterfall`
+
+Returns the latest waterfall image for the default or selected node.
+
+- Optional query parameter: `node`
+- Returns `503` when no waterfall is available yet
+
+#### `GET /waterfall/<node>.<png|webp>?frame=<frame_id>`
+
+Returns a specific waterfall image format for a node.
+
+- Supported formats: `png`, `webp`
+- Optional query parameter: `frame`
+- Returns `404` if the node, frame, or image format is unavailable
+
+### Utility generator endpoints
+
+These endpoints consume entropy from the same public pool and return JSON.
+
+#### `GET /api/password`
+
+Query parameters:
+
+- `length` default `16`, allowed `1..1024`
+- `count` default `1`, allowed `1..1000`
+- `lowercase` default `1`
+- `uppercase` default `1`
+- `numbers` default `1`
+- `special` default `1`
+
+Errors:
+
+- `400 {"error":"Invalid parameters"}`
+- `400 {"error":"Empty alphabet"}`
+- `503 Warming up...`
+
+Example:
+
+```bash
+curl "https://entropy.sparksome.pl/api/password?length=24&count=3"
+```
+
+#### `GET /api/pin`
+
+Query parameters:
+
+- `length` default `4`, allowed values: `4` or `6`
+- `count` default `1`, allowed `1..1000`
+
+Errors:
+
+- `400 {"error":"Invalid parameters"}`
+- `503 Warming up...`
+
+Example:
+
+```bash
+curl "https://entropy.sparksome.pl/api/pin?length=6&count=5"
+```
+
+#### `GET /api/lotto`
+
+Query parameters:
+
+- `count` default `1`, allowed `1..1000`
+
+Response:
+
+- JSON with `lotto`, where each item is a sorted draw of 6 unique integers from `1..49`
+
+Errors:
+
+- `400 {"error":"Invalid parameters"}`
+- `503 Warming up...`
+
+Example:
+
+```bash
+curl "https://entropy.sparksome.pl/api/lotto?count=3"
+```
+
+## Public Limits And Behavior
+
+At the time of writing, the public service is configured with the following operational limits:
+
+```text
+HTTP general: 10 req/s, burst 10
+HTTP heavy (/raw, /raw/stream, /download/entropy): 2 req/s, burst 2-3
+HTTP concurrent connections per IP: 20
+TCP concurrent connections per IP: 3
+/raw chunk: 65536 bytes
+/raw/stream default: 1048576 bytes
+TCP session default: 65536 bytes
+```
+
+These values may evolve over time. When in doubt, inspect `/healthz` for the current runtime-facing chunk and session settings.
+
+## Security Disclaimer And Intended Use
+
+The public API is meant for experimentation, prototyping, research workflows, education, self-hosting reference, and as an external entropy input for systems that intentionally mix it with local randomness.
+
+Important boundaries:
+
+- it is not a replacement for the operating system CSPRNG
+- it is not presented as a certified HSM, certified TRNG appliance, or formal compliance product
+- it is not a promise of uninterrupted public throughput under all conditions
+- production use remains the integrator's responsibility
+
+For higher-assurance production environments, use this stack as a self-hosted component, mix it with your local entropy strategy, or arrange a dedicated deployment model.
+
 ## Audit Reports
 
 The `audit` container periodically downloads a sample from the generator and runs statistical checks against it.
