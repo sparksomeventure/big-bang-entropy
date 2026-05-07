@@ -1,8 +1,12 @@
-# Big Bang Entropy Core Starter
+# Big Bang Entropy Open-Source Starter
 
-**Official project website:** [https://entropy.sparksome.pl](https://entropy.sparksome.pl)
+This directory contains the files needed to package and run a minimal self-hosted edition of Big Bang Entropy.
 
-This directory contains the supporting files for a minimal open-source package of the project.
+If you are looking for the full project description, public service details, or broader architecture notes, use the main repository README:
+
+- [Main project README](https://github.com/sparksomeventure/big-bang-entropy/blob/main/README.md)
+
+This document is intentionally focused on the starter package itself: what goes into it, how to assemble it, and how to run it locally or on your own infrastructure.
 
 The intended package consists of:
 
@@ -117,9 +121,9 @@ The most important settings for a node deployment are:
 
 For a multi-host setup, the SDR node does not need a local generator container. It can send UDP packets to any reachable generator instance.
 
-## API And Ports
+## Local Interfaces And Ports
 
-The minimal package exposes a few important interfaces:
+The starter package exposes a few important local interfaces:
 
 - `http://localhost:8080/` - dashboard
 - `localhost:1420` - raw TCP entropy stream
@@ -135,47 +139,9 @@ Common generator endpoints:
 - `/source-audits` - latest raw-signal audits reported by SDR nodes
 - `/waterfalls` - available waterfall frames
 
-## Service Model
+## Local API Reference
 
-Big Bang Entropy can be consumed in three different ways:
-
-- Public API: free, no account, no API key, intended for experiments, integration tests, prototypes, and lightweight usage
-- Self-hosted open-source stack: deploy the generator, SDR node, audit, and nginx components in your own infrastructure
-- Dedicated deployment: for higher throughput, isolated infrastructure, private networking, or deployment support
-
-The public API should be treated as a best-effort service rather than a formally guaranteed commercial SLA endpoint.
-
-## Quick Start In 30 Seconds
-
-Check the current public service state:
-
-```bash
-curl https://entropy.sparksome.pl/healthz
-```
-
-Download one raw entropy chunk:
-
-```bash
-curl https://entropy.sparksome.pl/raw --output entropy.bin
-```
-
-Try a ready-to-use JSON endpoint:
-
-```bash
-curl "https://entropy.sparksome.pl/api/password?length=24&count=3"
-```
-
-## Public API Reference
-
-### Base URL
-
-```text
-https://entropy.sparksome.pl
-```
-
-### Authentication
-
-No account and no API key are required for the public service.
+The starter package exposes the same application endpoints, but in your own local or self-hosted environment.
 
 ### Output formats
 
@@ -190,28 +156,28 @@ No account and no API key are required for the public service.
 Returns a single binary chunk of raw entropy.
 
 - Response: `200 OK` with `application/octet-stream`
-- Warm-up behavior: `503 Warming up...` when the public pool is not ready
-- Chunk size: controlled by server configuration, currently exposed by `/healthz` as `raw_http_chunk`
+- Warm-up behavior: `503 Warming up...` when the pool is not ready
+- Chunk size: controlled by local server configuration, currently exposed by `/healthz` as `raw_http_chunk`
 
 Example:
 
 ```bash
-curl https://entropy.sparksome.pl/raw --output entropy.bin
+curl http://localhost:8080/raw --output entropy.bin
 ```
 
 #### `GET /raw/stream?bytes=<n>`
 
-Streams up to the requested number of bytes from the public pool.
+Streams up to the requested number of bytes from the local entropy pool.
 
 - Query parameter: `bytes` optional, positive integer
-- Default request size: `STREAM_CHUNK_BYTES * 16`, exposed operationally on the service
+- Default request size: `STREAM_CHUNK_BYTES * 16`, exposed operationally by the local service
 - Response: `200 OK` with streamed `application/octet-stream`
 - Partial delivery is possible when the pool is still warming up or temporarily low
 
 Example:
 
 ```bash
-curl "https://entropy.sparksome.pl/raw/stream?bytes=1048576" --output 1mb.bin
+curl "http://localhost:8080/raw/stream?bytes=1048576" --output 1mb.bin
 ```
 
 #### `GET /download/entropy?bytes=<n>`
@@ -225,14 +191,14 @@ Same entropy stream as `/raw/stream`, but returned with a download-oriented file
 Example:
 
 ```bash
-curl -OJ "https://entropy.sparksome.pl/download/entropy?bytes=65536"
+curl -OJ "http://localhost:8080/download/entropy?bytes=65536"
 ```
 
 ### Diagnostics and monitoring endpoints
 
 #### `GET /healthz`
 
-Returns the current high-level status of the public service, including:
+Returns the current high-level status of the local service, including:
 
 - pool size in bytes
 - pool fill percentage
@@ -244,7 +210,7 @@ Returns the current high-level status of the public service, including:
 Example:
 
 ```bash
-curl https://entropy.sparksome.pl/healthz
+curl http://localhost:8080/healthz
 ```
 
 #### `GET /sources`
@@ -254,7 +220,7 @@ Returns the current snapshot of source nodes and their latest activity and audit
 Example:
 
 ```bash
-curl https://entropy.sparksome.pl/sources
+curl http://localhost:8080/sources
 ```
 
 #### `GET /source-audits`
@@ -264,7 +230,7 @@ Returns the latest raw-signal audit payloads reported by SDR nodes.
 Example:
 
 ```bash
-curl https://entropy.sparksome.pl/source-audits
+curl http://localhost:8080/source-audits
 ```
 
 #### `GET /waterfalls`
@@ -274,7 +240,7 @@ Returns a JSON list of available waterfall previews and frame metadata.
 Example:
 
 ```bash
-curl https://entropy.sparksome.pl/waterfalls
+curl http://localhost:8080/waterfalls
 ```
 
 #### `GET /waterfall`
@@ -294,7 +260,7 @@ Returns a specific waterfall image format for a node.
 
 ### Utility generator endpoints
 
-These endpoints consume entropy from the same public pool and return JSON.
+These endpoints consume entropy from the same local pool and return JSON.
 
 #### `GET /api/password`
 
@@ -316,7 +282,7 @@ Errors:
 Example:
 
 ```bash
-curl "https://entropy.sparksome.pl/api/password?length=24&count=3"
+curl "http://localhost:8080/api/password?length=24&count=3"
 ```
 
 #### `GET /api/pin`
@@ -334,7 +300,7 @@ Errors:
 Example:
 
 ```bash
-curl "https://entropy.sparksome.pl/api/pin?length=6&count=5"
+curl "http://localhost:8080/api/pin?length=6&count=5"
 ```
 
 #### `GET /api/lotto`
@@ -355,37 +321,19 @@ Errors:
 Example:
 
 ```bash
-curl "https://entropy.sparksome.pl/api/lotto?count=3"
+curl "http://localhost:8080/api/lotto?count=3"
 ```
 
-## Public Limits And Behavior
+## Intended Use
 
-At the time of writing, the public service is configured with the following operational limits:
+This starter is meant for:
 
-```text
-HTTP general: 10 req/s, burst 10
-HTTP heavy (/raw, /raw/stream, /download/entropy): 2 req/s, burst 2-3
-HTTP concurrent connections per IP: 20
-TCP concurrent connections per IP: 3
-/raw chunk: 65536 bytes
-/raw/stream default: 1048576 bytes
-TCP session default: 65536 bytes
-```
+- local evaluation
+- self-hosted deployments
+- SDR node experiments
+- integration into your own infrastructure
 
-These values may evolve over time. When in doubt, inspect `/healthz` for the current runtime-facing chunk and session settings.
-
-## Security Disclaimer And Intended Use
-
-The public API is meant for experimentation, prototyping, research workflows, education, self-hosting reference, and as an external entropy input for systems that intentionally mix it with local randomness.
-
-Important boundaries:
-
-- it is not a replacement for the operating system CSPRNG
-- it is not presented as a certified HSM, certified TRNG appliance, or formal compliance product
-- it is not a promise of uninterrupted public throughput under all conditions
-- production use remains the integrator's responsibility
-
-For higher-assurance production environments, use this stack as a self-hosted component, mix it with your local entropy strategy, or arrange a dedicated deployment model.
+It is not a separate commercial SLA document and it is not the primary place for describing the public hosted service. For project-wide positioning and hosted-service context, refer to the main repository README.
 
 ## Audit Reports
 
