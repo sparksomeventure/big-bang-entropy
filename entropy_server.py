@@ -924,6 +924,10 @@ class EntropyRNG:
         return result
 
 
+def _meets_password_requirements(password: str, required_charsets):
+    return all(any(ch in charset for ch in password) for charset in required_charsets)
+
+
 @app.route("/api/password")
 def api_password():
     length = int(request.args.get("length", 16))
@@ -937,23 +941,37 @@ def api_password():
         return jsonify({"error": "Invalid parameters"}), 400
 
     alphabet = ""
+    required_charsets = []
     if use_lowercase:
-        alphabet += string.ascii_lowercase
+        charset = string.ascii_lowercase
+        alphabet += charset
+        required_charsets.append(charset)
     if use_uppercase:
-        alphabet += string.ascii_uppercase
+        charset = string.ascii_uppercase
+        alphabet += charset
+        required_charsets.append(charset)
     if use_numbers:
-        alphabet += string.digits
+        charset = string.digits
+        alphabet += charset
+        required_charsets.append(charset)
     if use_special:
-        alphabet += "!@#$%^&*()_+=-[]{}|;:,.<>?"
+        charset = "!@#$%^&*()_+=-[]{}|;:,.<>?"
+        alphabet += charset
+        required_charsets.append(charset)
 
     if not alphabet:
         return jsonify({"error": "Empty alphabet"}), 400
+    if length < len(required_charsets):
+        return jsonify({"error": "Length is too short for selected character classes"}), 400
 
     rng = EntropyRNG()
     passwords = []
     try:
         for _ in range(count):
-            pwd = "".join(rng.choice(alphabet) for _ in range(length))
+            while True:
+                pwd = "".join(rng.choice(alphabet) for _ in range(length))
+                if _meets_password_requirements(pwd, required_charsets):
+                    break
             passwords.append(pwd)
     except ValueError as e:
         return str(e), 503
