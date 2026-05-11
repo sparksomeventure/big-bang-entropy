@@ -1,4 +1,6 @@
 import base64
+import atexit
+import hmac
 import hashlib
 import json
 import os
@@ -33,6 +35,28 @@ NODE_TTL_SEC = int(os.getenv("NODE_TTL_SEC", str(6 * 60 * 60)))
 SOURCE_AUDIT_STATE_PATH = Path(
     os.getenv("SOURCE_AUDIT_STATE_PATH", "/tmp/bbe-source-audits.json")
 )
+ENTROPY_PERSIST_PATH_VALUE = os.getenv("ENTROPY_PERSIST_PATH", "")
+ENTROPY_PERSIST_PATH = (
+    Path(ENTROPY_PERSIST_PATH_VALUE).expanduser() if ENTROPY_PERSIST_PATH_VALUE else None
+)
+ENTROPY_PERSIST_KEY = os.getenv("ENTROPY_PERSIST_KEY", "")
+ENTROPY_PERSIST_KEY_FILE_VALUE = os.getenv("ENTROPY_PERSIST_KEY_FILE", "")
+ENTROPY_PERSIST_KEY_FILE = (
+    Path(ENTROPY_PERSIST_KEY_FILE_VALUE).expanduser()
+    if ENTROPY_PERSIST_KEY_FILE_VALUE
+    else None
+)
+ENTROPY_PERSIST_INTERVAL_SEC = float(os.getenv("ENTROPY_PERSIST_INTERVAL_SEC", "5.0"))
+ENTROPY_PERSIST_ON_CONSUME = os.getenv("ENTROPY_PERSIST_ON_CONSUME", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+ENTROPY_REKEY_RESTORED_POOL = os.getenv("ENTROPY_REKEY_RESTORED_POOL", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD = float(
     os.getenv("SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD", "0.9")
 )
@@ -61,6 +85,10 @@ AUTOSTART_THREADS = os.getenv("ENTROPY_SERVER_AUTOSTART_THREADS", "1").lower() i
 
 entropy_pool = bytearray()
 pool_lock = threading.Lock()
+entropy_checkpoint_lock = threading.RLock()
+entropy_checkpoint_event = threading.Event()
+entropy_checkpoint_loaded = False
+last_entropy_checkpoint_at = 0.0
 
 raw_pool = bytearray()
 raw_pool_lock = threading.Lock()
@@ -85,6 +113,183 @@ def log(message: str):
     print(message, flush=True)
 
 
+def _entropy_persistence_enabled() -> bool:
+    return ENTROPY_PERSIST_PATH is not None and (
+        bool(ENTROPY_PERSIST_KEY) or ENTROPY_PERSIST_KEY_FILE is not None
+    )
+
+
+def _read_entropy_persist_key() -> bytes:
+    if ENTROPY_PERSIST_KEY_FILE is not None:
+        key_text = ENTROPY_PERSIST_KEY_FILE.read_text(encoding="utf-8").strip()
+    else:
+        key_text = ENTROPY_PERSIST_KEY.strip()
+
+    if not key_text:
+        raise ValueError("empty entropy persistence key")
+
+    try:
+        decoded = base64.b64decode(key_text, validate=True)
+        if len(decoded) >= 32:
+            return decoded
+    except Exception:
+        pass
+
+    return key_text.encode("utf-8")
+
+
+def _derive_entropy_checkpoint_keys(salt: bytes) -> tuple[bytes, bytes]:
+    master_key = _read_entropy_persist_key()
+    material = hashlib.pbkdf2_hmac("sha512", master_key, salt, 210_000, dklen=128)
+    return material[:64], material[64:]
+
+
+def _checkpoint_keystream(enc_key: bytes, nonce: bytes, length: int) -> bytes:
+    stream = bytearray()
+    counter = 0
+    while len(stream) < length:
+        stream.extend(
+            hmac.new(
+                enc_key,
+                nonce + counter.to_bytes(8, "big"),
+                hashlib.sha512,
+            ).digest()
+        )
+        counter += 1
+    return bytes(stream[:length])
+
+
+def _xor_bytes(left: bytes, right: bytes) -> bytes:
+    return bytes(a ^ b for a, b in zip(left, right))
+
+
+def _pack_entropy_checkpoint(pool_snapshot: bytes) -> bytes:
+    salt = os.urandom(32)
+    nonce = os.urandom(24)
+    enc_key, mac_key = _derive_entropy_checkpoint_keys(salt)
+    ciphertext = _xor_bytes(
+        pool_snapshot,
+        _checkpoint_keystream(enc_key, nonce, len(pool_snapshot)),
+    )
+    payload = {
+        "version": 1,
+        "created_at": time.time(),
+        "pool_size": len(pool_snapshot),
+        "salt_b64": base64.b64encode(salt).decode("ascii"),
+        "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext_b64": base64.b64encode(ciphertext).decode("ascii"),
+    }
+    mac_body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload["hmac_b64"] = base64.b64encode(
+        hmac.new(mac_key, mac_body, hashlib.sha512).digest()
+    ).decode("ascii")
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _unpack_entropy_checkpoint(checkpoint_bytes: bytes) -> bytes:
+    payload = json.loads(checkpoint_bytes.decode("utf-8"))
+    if payload.get("version") != 1:
+        raise ValueError("unsupported entropy checkpoint version")
+
+    hmac_b64 = payload.pop("hmac_b64", "")
+    salt = base64.b64decode(payload["salt_b64"], validate=True)
+    nonce = base64.b64decode(payload["nonce_b64"], validate=True)
+    ciphertext = base64.b64decode(payload["ciphertext_b64"], validate=True)
+    enc_key, mac_key = _derive_entropy_checkpoint_keys(salt)
+
+    mac_body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    expected_mac = hmac.new(mac_key, mac_body, hashlib.sha512).digest()
+    supplied_mac = base64.b64decode(hmac_b64, validate=True)
+    if not hmac.compare_digest(expected_mac, supplied_mac):
+        raise ValueError("entropy checkpoint authentication failed")
+
+    pool_snapshot = _xor_bytes(ciphertext, _checkpoint_keystream(enc_key, nonce, len(ciphertext)))
+    declared_size = int(payload.get("pool_size", -1))
+    if declared_size != len(pool_snapshot):
+        raise ValueError("entropy checkpoint size mismatch")
+    return pool_snapshot
+
+
+def _rekey_restored_entropy(restored_pool: bytes) -> bytes:
+    if not ENTROPY_REKEY_RESTORED_POOL or not restored_pool:
+        return restored_pool
+
+    restored_seed = os.urandom(64)
+    output = bytearray()
+    local_state = hashlib.sha512(
+        restored_seed + hashlib.sha512(restored_pool).digest()
+    ).digest()
+    for offset in range(0, len(restored_pool), MIX_BLOCK_BYTES):
+        block = restored_pool[offset : offset + MIX_BLOCK_BYTES]
+        local_state = hashlib.sha512(local_state + block + os.urandom(32)).digest()
+        output.extend(local_state)
+    return bytes(output[: len(restored_pool)])
+
+
+def _load_entropy_checkpoint():
+    global entropy_checkpoint_loaded, generator_state
+    if not _entropy_persistence_enabled():
+        return
+    if not ENTROPY_PERSIST_PATH.exists():
+        entropy_checkpoint_loaded = True
+        return
+
+    try:
+        restored_pool = _unpack_entropy_checkpoint(ENTROPY_PERSIST_PATH.read_bytes())
+        restored_pool = _rekey_restored_entropy(restored_pool)
+        with pool_lock:
+            entropy_pool.clear()
+            entropy_pool.extend(restored_pool[-POOL_MAX_BYTES:])
+        with generator_state_lock:
+            generator_state = hashlib.sha512(
+                generator_state + hashlib.sha512(restored_pool).digest() + os.urandom(64)
+            ).digest()
+        entropy_checkpoint_loaded = True
+        log(
+            f"[*] Restored encrypted entropy checkpoint "
+            f"bytes={len(restored_pool)} path={ENTROPY_PERSIST_PATH}"
+        )
+    except Exception as exc:
+        entropy_checkpoint_loaded = False
+        log(f"[!] Ignoring invalid entropy checkpoint {ENTROPY_PERSIST_PATH}: {exc}")
+
+
+def _write_entropy_checkpoint(snapshot: Optional[bytes] = None) -> bool:
+    global last_entropy_checkpoint_at
+    if not _entropy_persistence_enabled():
+        return True
+
+    with entropy_checkpoint_lock:
+        if snapshot is None:
+            with pool_lock:
+                snapshot = bytes(entropy_pool)
+        try:
+            ENTROPY_PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_bytes = _pack_entropy_checkpoint(snapshot)
+            tmp_path = ENTROPY_PERSIST_PATH.with_name(f".{ENTROPY_PERSIST_PATH.name}.tmp")
+            tmp_path.write_bytes(checkpoint_bytes)
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, ENTROPY_PERSIST_PATH)
+            last_entropy_checkpoint_at = time.time()
+            return True
+        except Exception as exc:
+            log(f"[!] Could not persist entropy checkpoint to {ENTROPY_PERSIST_PATH}: {exc}")
+            return False
+
+
+def _request_entropy_checkpoint():
+    if _entropy_persistence_enabled():
+        entropy_checkpoint_event.set()
+
+
+def _persist_after_consume_if_needed(snapshot: bytes):
+    if _entropy_persistence_enabled() and ENTROPY_PERSIST_ON_CONSUME:
+        return _write_entropy_checkpoint(snapshot)
+    else:
+        _request_entropy_checkpoint()
+        return True
+
+
 def _clamp_pool():
     global entropy_pool
     margin = 10 * 1024 * 1024
@@ -105,6 +310,7 @@ def _store_entropy(payload: bytes):
     with pool_lock:
         entropy_pool.extend(payload)
         _clamp_pool()
+    _request_entropy_checkpoint()
 
 
 def _persist_source_audits():
@@ -173,23 +379,60 @@ def _node_accepts_samples(node_name: str) -> bool:
 
 def _pop_entropy_chunk(chunk_size: int) -> Optional[bytes]:
     global entropy_pool
+    snapshot = None
+    if _entropy_persistence_enabled() and ENTROPY_PERSIST_ON_CONSUME:
+        with entropy_checkpoint_lock:
+            with pool_lock:
+                if len(entropy_pool) < chunk_size:
+                    return None
+                data = bytes(entropy_pool[-chunk_size:])
+                del entropy_pool[-chunk_size:]
+                snapshot = bytes(entropy_pool)
+            if not _write_entropy_checkpoint(snapshot):
+                with pool_lock:
+                    entropy_pool.extend(data)
+                    _clamp_pool()
+                return None
+            return data
+
     with pool_lock:
         if len(entropy_pool) < chunk_size:
             return None
         data = bytes(entropy_pool[-chunk_size:])
         del entropy_pool[-chunk_size:]
-        return data
+        snapshot = bytes(entropy_pool)
+    _persist_after_consume_if_needed(snapshot)
+    return data
 
 
 def _pop_entropy_chunk_up_to(chunk_size: int) -> Optional[bytes]:
     global entropy_pool
+    snapshot = None
+    if _entropy_persistence_enabled() and ENTROPY_PERSIST_ON_CONSUME:
+        with entropy_checkpoint_lock:
+            with pool_lock:
+                if not entropy_pool:
+                    return None
+                actual_size = min(len(entropy_pool), chunk_size)
+                data = bytes(entropy_pool[-actual_size:])
+                del entropy_pool[-actual_size:]
+                snapshot = bytes(entropy_pool)
+            if not _write_entropy_checkpoint(snapshot):
+                with pool_lock:
+                    entropy_pool.extend(data)
+                    _clamp_pool()
+                return None
+            return data
+
     with pool_lock:
         if not entropy_pool:
             return None
         actual_size = min(len(entropy_pool), chunk_size)
         data = bytes(entropy_pool[-actual_size:])
         del entropy_pool[-actual_size:]
-        return data
+        snapshot = bytes(entropy_pool)
+    _persist_after_consume_if_needed(snapshot)
+    return data
 
 def _pop_raw_chunk(chunk_size: int) -> Optional[bytes]:
     global raw_pool
@@ -742,6 +985,13 @@ def healthz():
             "rejecting_source_nodes": rejecting_nodes,
             "source_audit_repeat_score_threshold": SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD,
             "source_audit_state_path": str(SOURCE_AUDIT_STATE_PATH),
+            "entropy_persistence_enabled": _entropy_persistence_enabled(),
+            "entropy_persist_path": str(ENTROPY_PERSIST_PATH)
+            if ENTROPY_PERSIST_PATH is not None
+            else None,
+            "entropy_persist_on_consume": ENTROPY_PERSIST_ON_CONSUME,
+            "entropy_rekey_restored_pool": ENTROPY_REKEY_RESTORED_POOL,
+            "last_entropy_checkpoint_at": last_entropy_checkpoint_at or None,
         }
     )
 
@@ -1056,7 +1306,25 @@ def stats_logger_worker():
         )
 
 
+def entropy_checkpoint_worker():
+    if not _entropy_persistence_enabled():
+        return
+
+    while True:
+        entropy_checkpoint_event.wait(ENTROPY_PERSIST_INTERVAL_SEC)
+        entropy_checkpoint_event.clear()
+
+        if time.time() - last_entropy_checkpoint_at < ENTROPY_PERSIST_INTERVAL_SEC:
+            continue
+
+        _write_entropy_checkpoint()
+
+
 def _start_background_threads():
+    _load_entropy_checkpoint()
+    if _entropy_persistence_enabled():
+        atexit.register(_write_entropy_checkpoint)
+
     log(
         "[*] Entropy generator starting "
         f"(http_port={HTTP_PORT}, telnet_port={TELNET_PORT}, "
@@ -1066,13 +1334,16 @@ def _start_background_threads():
         f"stream_chunk_bytes={STREAM_CHUNK_BYTES}, "
         f"low_pool_threshold_pct={LOW_POOL_THRESHOLD_PCT}, "
         f"throttle_bytes_per_sec={THROTTLE_BYTES_PER_SEC}, "
-        f"source_audit_repeat_score_threshold={SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD})"
+        f"source_audit_repeat_score_threshold={SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD}, "
+        f"entropy_persistence_enabled={_entropy_persistence_enabled()}, "
+        f"entropy_persist_path={ENTROPY_PERSIST_PATH})"
     )
     threading.Thread(target=udp_receiver_worker, daemon=True).start()
     threading.Thread(target=telnet_server_worker, daemon=True).start()
     threading.Thread(target=raw_telnet_server_worker, daemon=True).start()
     threading.Thread(target=cleanup_incomplete_images_worker, daemon=True).start()
     threading.Thread(target=stats_logger_worker, daemon=True).start()
+    threading.Thread(target=entropy_checkpoint_worker, daemon=True).start()
     log("[*] Entropy generator background threads online")
 
 
