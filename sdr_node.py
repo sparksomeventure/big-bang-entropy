@@ -1,16 +1,19 @@
 import base64
+import binascii
 import ctypes
 import io
 import json
 import math
 import os
 import socket
+import struct
 import threading
 import time
 import uuid
 import urllib.request
 import urllib.parse
 import ssl
+import zlib
 from collections import deque
 
 import iio
@@ -43,6 +46,11 @@ RTL_SDR_INDEX = int(os.getenv("RTL_SDR_INDEX", "0"))
 SAMPLE_RATE = float(os.getenv("SAMPLE_RATE", "2.048e6"))
 PLUTO_BUFFER_SAMPLES = int(os.getenv("PLUTO_BUFFER_SAMPLES", "32768"))
 RTL_READ_BYTES = int(os.getenv("RTL_READ_BYTES", "262144"))
+DUMMY_READ_BYTES = int(os.getenv("DUMMY_READ_BYTES", str(32768 * 4)))
+DUMMY_SIGNAL_HZ = float(os.getenv("DUMMY_SIGNAL_HZ", "142000"))
+DUMMY_NOISE_STDDEV = float(os.getenv("DUMMY_NOISE_STDDEV", "9000"))
+DUMMY_SIGNAL_AMPLITUDE = float(os.getenv("DUMMY_SIGNAL_AMPLITUDE", "12000"))
+DUMMY_READ_SLEEP_SEC = float(os.getenv("DUMMY_READ_SLEEP_SEC", "0.02"))
 ENTROPY_DECIMATION_FACTOR = max(1, int(os.getenv("ENTROPY_DECIMATION_FACTOR", "4")))
 HTTP_TARGET_PORT = os.getenv("HTTP_TARGET_PORT", "8080")
 HTTP_TARGET_PROTOCOL = os.getenv("HTTP_TARGET_PROTOCOL", "http")
@@ -139,6 +147,42 @@ class SDRSourceHandle:
         self.source = source
         self.ctx = ctx
         self.dev = dev
+
+
+class DummySdr:
+    def __init__(
+        self,
+        sample_rate,
+        read_bytes,
+        signal_hz,
+        noise_stddev,
+        signal_amplitude,
+    ):
+        self.sample_rate = float(sample_rate)
+        self.read_bytes = int(read_bytes)
+        self.signal_hz = float(signal_hz)
+        self.noise_stddev = float(noise_stddev)
+        self.signal_amplitude = float(signal_amplitude)
+        self.sample_index = 0
+        self.rng = np.random.default_rng()
+
+    def read(self):
+        iq_pairs = max(2, self.read_bytes // 4)
+        idx = np.arange(iq_pairs, dtype=np.float64) + self.sample_index
+        self.sample_index += iq_pairs
+
+        phase = 2.0 * np.pi * self.signal_hz * idx / self.sample_rate
+        slow_phase = 2.0 * np.pi * idx / max(1.0, self.sample_rate * 0.7)
+        envelope = 0.65 + 0.35 * np.sin(slow_phase)
+        signal_i = np.cos(phase) * self.signal_amplitude * envelope
+        signal_q = np.sin(phase) * self.signal_amplitude * envelope
+        noise_i = self.rng.normal(0.0, self.noise_stddev, iq_pairs)
+        noise_q = self.rng.normal(0.0, self.noise_stddev, iq_pairs)
+
+        interleaved = np.empty(iq_pairs * 2, dtype=np.int16)
+        interleaved[0::2] = np.clip(signal_i + noise_i, -32768, 32767).astype(np.int16)
+        interleaved[1::2] = np.clip(signal_q + noise_q, -32768, 32767).astype(np.int16)
+        return interleaved.tobytes()
 
 
 class CompatRtlSdr:
@@ -460,6 +504,21 @@ def cleanup_sdr_source(source):
 
 
 def initialize_sdr_source():
+    if SDR_TYPE == "dummy":
+        dummy = DummySdr(
+            sample_rate=SAMPLE_RATE,
+            read_bytes=DUMMY_READ_BYTES,
+            signal_hz=DUMMY_SIGNAL_HZ,
+            noise_stddev=DUMMY_NOISE_STDDEV,
+            signal_amplitude=DUMMY_SIGNAL_AMPLITUDE,
+        )
+        log(
+            "[*] Dummy SDR initialized "
+            f"(sample_rate={SAMPLE_RATE}, read_bytes={DUMMY_READ_BYTES}, "
+            f"signal_hz={DUMMY_SIGNAL_HZ}, noise_stddev={DUMMY_NOISE_STDDEV})"
+        )
+        return SDRSourceHandle(dummy)
+
     if SDR_TYPE == "rtlsdr":
         sdr_obj = CompatRtlSdr(device_index=RTL_SDR_INDEX)
         sdr_obj.sample_rate = SAMPLE_RATE
@@ -517,6 +576,10 @@ def entropy_sender_worker(source):
             if SDR_TYPE == "rtlsdr":
                 # read_bytes(n) returns bytes/bytearray for RTL-SDR
                 raw_data = source.source.read_bytes(RTL_READ_BYTES)
+            elif SDR_TYPE == "dummy":
+                raw_data = source.source.read()
+                if DUMMY_READ_SLEEP_SEC > 0:
+                    time.sleep(DUMMY_READ_SLEEP_SEC)
             else:
                 # buffer.refill() for PlutoSDR
                 source.source.refill()
@@ -598,6 +661,131 @@ def entropy_sender_worker(source):
             time.sleep(1)
 
 
+def encode_rgb_png(rgb: np.ndarray) -> bytes:
+    height, width, channels = rgb.shape
+    if channels != 3:
+        raise ValueError("PNG encoder expects RGB data")
+
+    def chunk(chunk_type: bytes, data: bytes) -> bytes:
+        checksum = binascii.crc32(chunk_type + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", checksum)
+
+    rows = [b"\x00" + np.ascontiguousarray(rgb[row]).tobytes() for row in range(height)]
+    payload = b"".join(rows)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(payload, 6))
+        + chunk(b"IEND", b"")
+    )
+
+
+def render_lightweight_waterfall_png(
+    current_power: np.ndarray,
+    y_min: float,
+    y_max: float,
+    history_frames,
+) -> bytes:
+    width = 960
+    height = 360
+    top = 30
+    bottom = 32
+    plot_h = height - top - bottom
+
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+    image[:, :, 0] = 2
+    image[:, :, 1] = 8
+    image[:, :, 2] = 10
+
+    for x_pos in range(0, width, 80):
+        image[top : height - bottom, x_pos : x_pos + 1] = (5, 42, 48)
+    for y_pos in range(top, height - bottom, 48):
+        image[y_pos : y_pos + 1, :] = (5, 42, 48)
+
+    xs_src = np.linspace(0, current_power.size - 1, current_power.size)
+    xs_dst = np.linspace(0, current_power.size - 1, width)
+    span = max(1e-6, y_max - y_min)
+
+    def draw_trace(values: np.ndarray, color, glow=False):
+        resampled = np.interp(xs_dst, xs_src, values)
+        norm = np.clip((resampled - y_min) / span, 0.0, 1.0)
+        ys = (height - bottom - 1 - norm * (plot_h - 1)).astype(np.int32)
+        for x_pos, y_pos in enumerate(ys):
+            image[y_pos : min(height - bottom, y_pos + 2), x_pos] = color
+            if glow:
+                y0 = max(top, y_pos - 2)
+                y1 = min(height - bottom, y_pos + 3)
+                image[y0:y1, x_pos, 1] = np.maximum(image[y0:y1, x_pos, 1], 75)
+                image[y0:y1, x_pos, 2] = np.maximum(image[y0:y1, x_pos, 2], 90)
+                image[y_pos : height - bottom, x_pos, 1] = np.maximum(
+                    image[y_pos : height - bottom, x_pos, 1],
+                    22,
+                )
+
+    for frame_index, history in enumerate(history_frames[:-1]):
+        fade = 50 + int(60 * (frame_index + 1) / max(1, len(history_frames)))
+        draw_trace(history, (8, fade, fade + 20), glow=False)
+    draw_trace(current_power, (103, 232, 249), glow=True)
+
+    title = f"{NODE_NAME}  {DISPLAY_FREQ_HZ / 1e6:.3f} MHz"
+    draw_ascii_label(image, title[:80], 24, 14, (103, 232, 249))
+    draw_ascii_label(image, "DUMMY SDR WATERFALL", 24, height - 24, (34, 211, 238))
+    return encode_rgb_png(image)
+
+
+def draw_ascii_label(image: np.ndarray, text: str, x: int, y: int, color):
+    glyph_w = 5
+    glyph_h = 7
+    cursor = x
+    for char in text.upper():
+        if cursor + glyph_w >= image.shape[1]:
+            break
+        pattern = SIMPLE_FONT.get(char, SIMPLE_FONT.get(" "))
+        for row, bits in enumerate(pattern):
+            for col, bit in enumerate(bits):
+                if bit == "1":
+                    y0 = y + row * 2
+                    x0 = cursor + col * 2
+                    image[y0 : y0 + 2, x0 : x0 + 2] = color
+        cursor += (glyph_w + 1) * 2
+
+
+SIMPLE_FONT = {
+    " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+    "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+    ".": ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
+    "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+    "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+    "2": ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+    "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+    "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+    "5": ["11111", "10000", "10000", "11110", "00001", "00001", "11110"],
+    "6": ["01110", "10000", "10000", "11110", "10001", "10001", "01110"],
+    "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+    "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+    "9": ["01110", "10001", "10001", "01111", "00001", "00001", "01110"],
+    "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "B": ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+    "D": ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+    "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+    "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+    "G": ["01110", "10001", "10000", "10111", "10001", "10001", "01110"],
+    "H": ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "I": ["01110", "00100", "00100", "00100", "00100", "00100", "01110"],
+    "L": ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+    "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+    "N": ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+    "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+    "S": ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+    "T": ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+    "U": ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "V": ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
+    "W": ["10001", "10001", "10001", "10101", "10101", "10101", "01010"],
+    "Y": ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+}
+
+
 def waterfall_sender_worker():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -659,77 +847,86 @@ def waterfall_sender_worker():
                 y_min = y_center - (y_span / 2.0)
                 y_max = y_center + (y_span / 2.0)
 
-            fig, ax = plt.subplots(figsize=(10, 4), dpi=130)
-            fig.subplots_adjust(left=0.11, right=0.985, top=0.88, bottom=0.18)
-            fig.patch.set_facecolor(THEME_BG)
-            ax.set_facecolor(THEME_BG)
+            if SDR_TYPE == "dummy":
+                frame_bytes = {"png": render_lightweight_waterfall_png(y, y_min, y_max, history_frames)}
+            else:
+                fig, ax = plt.subplots(figsize=(10, 4), dpi=130)
+                fig.subplots_adjust(left=0.11, right=0.985, top=0.88, bottom=0.18)
+                fig.patch.set_facecolor(THEME_BG)
+                ax.set_facecolor(THEME_BG)
 
-            gradient = np.linspace(0, 1, 600)
-            gradient = np.vstack((gradient, gradient))
-            ax.imshow(
-                gradient,
-                extent=[float(x.min()), float(x.max()), y_min, y_max],
-                cmap=WATERFALL_BG_CMAP,
-                aspect="auto",
-                alpha=0.22,
-                origin="lower",
-                zorder=0,
-            )
-
-            points = np.array([x, y]).T.reshape(-1, 1, 2)
-            segments = np.concatenate([points[:-1], points[1:]], axis=1)
-            line = LineCollection(segments, cmap=WATERFALL_LINE_CMAP, linewidth=2.2)
-            line.set_array(np.linspace(0, 1, len(segments)))
-            line.set_zorder(4)
-            ax.add_collection(line)
-
-            for history_index, history_y in enumerate(history_frames[:-1]):
-                alpha = 0.05 + (0.18 * (history_index + 1) / max(1, len(history_frames)))
-                ax.plot(
-                    x,
-                    history_y,
-                    color=THEME_HISTORY,
-                    linewidth=1.4,
-                    alpha=alpha,
-                    zorder=1.5 + history_index * 0.1,
+                gradient = np.linspace(0, 1, 600)
+                gradient = np.vstack((gradient, gradient))
+                ax.imshow(
+                    gradient,
+                    extent=[float(x.min()), float(x.max()), y_min, y_max],
+                    cmap=WATERFALL_BG_CMAP,
+                    aspect="auto",
+                    alpha=0.22,
+                    origin="lower",
+                    zorder=0,
                 )
 
-            ax.plot(x, y, color=THEME_PRIMARY, linewidth=6, alpha=0.10, zorder=3)
-            ax.plot(x, y, color=THEME_ACCENT, linewidth=1.4, alpha=0.95, zorder=6)
-            ax.fill_between(x, y, y_min, color=THEME_PRIMARY, alpha=0.16, zorder=2)
-            ax.fill_between(x, y, y_min, color=THEME_SECONDARY, alpha=0.08, zorder=1)
-            ax.scatter(x[::64], y[::64], s=6, c=THEME_ACCENT, alpha=0.35, linewidths=0, zorder=5)
+                points = np.array([x, y]).T.reshape(-1, 1, 2)
+                segments = np.concatenate([points[:-1], points[1:]], axis=1)
+                line = LineCollection(segments, cmap=WATERFALL_LINE_CMAP, linewidth=2.2)
+                line.set_array(np.linspace(0, 1, len(segments)))
+                line.set_zorder(4)
+                ax.add_collection(line)
 
-            ax.set_title(
-                f"Node {NODE_NAME} - Cosmic Noise @ {DISPLAY_FREQ_HZ / axis_scale_hz:.3f} {axis_unit}",
-                color=THEME_PRIMARY,
-                fontsize=12,
-                pad=12,
-            )
-            ax.set_xlabel(f"Frequency [{axis_unit}]", color=THEME_PRIMARY)
-            ax.set_ylabel("Power [dB]", color=THEME_PRIMARY)
-            ax.grid(True, alpha=0.16, color=THEME_PRIMARY, linestyle=":")
-            ax.set_ylim(y_min, y_max)
-            ax.tick_params(colors=THEME_PRIMARY)
-            ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.3f}"))
-            ax.xaxis.offsetText.set_visible(False)
-            for spine in ax.spines.values():
-                spine.set_color(THEME_PRIMARY)
-                spine.set_alpha(0.7)
+                for history_index, history_y in enumerate(history_frames[:-1]):
+                    alpha = 0.05 + (0.18 * (history_index + 1) / max(1, len(history_frames)))
+                    ax.plot(
+                        x,
+                        history_y,
+                        color=THEME_HISTORY,
+                        linewidth=1.4,
+                        alpha=alpha,
+                        zorder=1.5 + history_index * 0.1,
+                    )
 
-            frame_bytes = {}
-            for image_format in ("png", "webp"):
-                buf = io.BytesIO()
-                save_kwargs = {
-                    "format": image_format.upper(),
-                    "facecolor": fig.get_facecolor(),
-                    "edgecolor": "none",
-                }
-                if image_format == "webp":
-                    save_kwargs["pil_kwargs"] = {"quality": 85, "method": 6}
-                fig.savefig(buf, **save_kwargs)
-                frame_bytes[image_format] = buf.getvalue()
-            plt.close(fig)
+                ax.plot(x, y, color=THEME_PRIMARY, linewidth=6, alpha=0.10, zorder=3)
+                ax.plot(x, y, color=THEME_ACCENT, linewidth=1.4, alpha=0.95, zorder=6)
+                ax.fill_between(x, y, y_min, color=THEME_PRIMARY, alpha=0.16, zorder=2)
+                ax.fill_between(x, y, y_min, color=THEME_SECONDARY, alpha=0.08, zorder=1)
+                ax.scatter(x[::64], y[::64], s=6, c=THEME_ACCENT, alpha=0.35, linewidths=0, zorder=5)
+
+                ax.set_title(
+                    f"Node {NODE_NAME} - Cosmic Noise @ {DISPLAY_FREQ_HZ / axis_scale_hz:.3f} {axis_unit}",
+                    color=THEME_PRIMARY,
+                    fontsize=12,
+                    pad=12,
+                )
+                ax.set_xlabel(f"Frequency [{axis_unit}]", color=THEME_PRIMARY)
+                ax.set_ylabel("Power [dB]", color=THEME_PRIMARY)
+                ax.grid(True, alpha=0.16, color=THEME_PRIMARY, linestyle=":")
+                ax.set_ylim(y_min, y_max)
+                ax.tick_params(colors=THEME_PRIMARY)
+                ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.3f}"))
+                ax.xaxis.offsetText.set_visible(False)
+                for spine in ax.spines.values():
+                    spine.set_color(THEME_PRIMARY)
+                    spine.set_alpha(0.7)
+
+                frame_bytes = {}
+                for image_format in ("png", "webp"):
+                    buf = io.BytesIO()
+                    save_kwargs = {
+                        "format": image_format.upper(),
+                        "facecolor": fig.get_facecolor(),
+                        "edgecolor": "none",
+                    }
+                    if image_format == "webp":
+                        save_kwargs["pil_kwargs"] = {"quality": 85, "method": 6}
+                    try:
+                        fig.savefig(buf, **save_kwargs)
+                        frame_bytes[image_format] = buf.getvalue()
+                    except Exception as exc:
+                        log(f"[!] Could not render {image_format} waterfall frame: {exc}")
+                plt.close(fig)
+            if not frame_bytes:
+                time.sleep(2)
+                continue
             frame_id = str(uuid.uuid4())
             frame_timestamp = time.time()
             part_count_summary = []
@@ -777,10 +974,15 @@ def source_audit_worker():
         f"sample_bytes~={SOURCE_AUDIT_SAMPLE_BYTES}, source=shared_raw_iq)"
     )
 
+    first_run = True
     while True:
         try:
-            # Wait for event or interval
-            triggered = audit_trigger_event.wait(timeout=max(1, SOURCE_AUDIT_INTERVAL_SEC))
+            triggered = False
+            if first_run:
+                pass
+            else:
+                # Wait for event or interval
+                triggered = audit_trigger_event.wait(timeout=max(1, SOURCE_AUDIT_INTERVAL_SEC))
             if triggered:
                 log("[*] Source audit triggered by status poller (STALE or WARN status).")
                 audit_trigger_event.clear()
@@ -806,6 +1008,7 @@ def source_audit_worker():
             with stats_lock:
                 runtime_stats["source_audits_sent"] += 1
                 runtime_stats["last_source_audit_at"] = time.time()
+            first_run = False
             log(
                 f"[*] Source audit sent (node={NODE_NAME}, repeat_score={metrics['repeat_score']}, "
                 f"spectral_flatness={metrics['spectral_flatness']})"
@@ -895,7 +1098,7 @@ def stats_logger_worker():
 if __name__ == "__main__":
     log(
         f"[*] SDR node {NODE_NAME} starting. Target: "
-        f"{UDP_TARGET_HOST}:{UDP_TARGET_PORT}, Source: Pluto {PLUTO_IP}"
+        f"{UDP_TARGET_HOST}:{UDP_TARGET_PORT}, Source type: {SDR_TYPE}"
     )
     log(
         f"[*] Frequency plan: mode={RADIO_FREQ_PLAN['mode']}, "
