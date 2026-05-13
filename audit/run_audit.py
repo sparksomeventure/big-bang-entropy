@@ -16,6 +16,7 @@ CHAIN_SECRET      = os.getenv("AUDIT_CHAIN_SECRET", "")
 DIEHARDER_TESTS   = [x.strip() for x in os.getenv("AUDIT_DIEHARDER_TESTS", "0,1,2,8,15,100").split(",") if x.strip()]
 SHA512_ROUNDS     = int(os.getenv("AUDIT_SHA512_ROUNDS", "32"))
 SOCKET_TIMEOUT    = float(os.getenv("AUDIT_SOCKET_TIMEOUT_SEC", "5"))
+FETCH_MAX_SEC     = float(os.getenv("AUDIT_FETCH_MAX_SEC", "300"))
 MAX_SESSIONS      = int(os.getenv("AUDIT_MAX_TCP_SESSIONS", "1024"))
 PRACTRAND_ENABLED = os.getenv("AUDIT_PRACTRAND", "0") == "1"
 PRACTRAND_TLMAX   = os.getenv("AUDIT_PRACTRAND_TLMAX", "256M")
@@ -42,12 +43,19 @@ def http_json(url):
 def fetch_sample_via_tcp(target_bytes, port=None):
     chunks, total, sessions = [], 0, 0
     started = time.perf_counter()
+    timed_out = False
     while total < target_bytes and sessions < MAX_SESSIONS:
+        if FETCH_MAX_SEC > 0 and time.perf_counter() - started >= FETCH_MAX_SEC:
+            timed_out = True
+            break
         sessions += 1
         with socket.create_connection((TARGET_HOST, port or TARGET_TCP_PORT), timeout=SOCKET_TIMEOUT) as s:
             s.settimeout(SOCKET_TIMEOUT)
             part = bytearray()
             while True:
+                if FETCH_MAX_SEC > 0 and time.perf_counter() - started >= FETCH_MAX_SEC:
+                    timed_out = True
+                    break
                 try:
                     d = s.recv(65536)
                 except socket.timeout:
@@ -64,7 +72,9 @@ def fetch_sample_via_tcp(target_bytes, port=None):
     dur = max(time.perf_counter() - started, 1e-6)
     sample = b"".join(chunks)[:target_bytes]
     return {"bytes": len(sample), "duration_sec": round(dur, 3), "sessions": sessions,
-            "throughput_mib_s": round((len(sample) / dur) / (1024*1024), 3), "data": sample}
+            "throughput_mib_s": round((len(sample) / dur) / (1024*1024), 3),
+            "target_bytes": target_bytes, "complete": len(sample) >= target_bytes,
+            "timed_out": timed_out, "fetch_max_sec": FETCH_MAX_SEC, "data": sample}
 
 # ---------------------------------------------------------------------------
 # External tool helpers
@@ -539,6 +549,11 @@ def main():
     sample = fetch_sample_via_tcp(SAMPLE_SIZE, port=TARGET_TCP_PORT)
     if sample["bytes"] <= 0:
         raise RuntimeError("Failed to fetch sample from TCP 1420.")
+    if not sample.get("complete", False):
+        alerts_early.append(
+            f"Final sample fetch stopped at {sample['bytes']} of {sample['target_bytes']} bytes "
+            f"after {sample['duration_sec']}s."
+        )
     if sample["throughput_mib_s"] < THROUGHPUT_WARN:
         alerts_early.append(f"Throughput {sample['throughput_mib_s']} MiB/s below warning threshold {THROUGHPUT_WARN} MiB/s.")
 
@@ -550,6 +565,11 @@ def main():
         pm_sample = fetch_sample_via_tcp(PREMIX_SIZE, port=TARGET_PREMIX_PORT)
         if pm_sample["bytes"] > 0:
             premix_data = pm_sample["data"]
+        if pm_sample["bytes"] > 0 and not pm_sample.get("complete", False):
+            alerts_early.append(
+                f"Pre-mix sample fetch stopped at {pm_sample['bytes']} of {pm_sample['target_bytes']} bytes "
+                f"after {pm_sample['duration_sec']}s."
+            )
     except Exception as e:
         alerts_early.append(f"Pre-mix sample fetch failed: {e}")
 
