@@ -29,6 +29,9 @@ POOL_SIZE_MB = int(os.getenv("POOL_SIZE_MB", "128"))
 POOL_MAX_BYTES = POOL_SIZE_MB * 1024 * 1024
 RAW_POOL_SIZE_MB = int(os.getenv("RAW_POOL_SIZE_MB", "64"))
 RAW_POOL_MAX_BYTES = RAW_POOL_SIZE_MB * 1024 * 1024
+ENTROPY_PERSIST_MAX_BYTES = int(
+    os.getenv("ENTROPY_PERSIST_MAX_BYTES", str(64 * 1024 * 1024))
+)
 IMAGE_ASSEMBLY_TTL_SEC = int(os.getenv("IMAGE_ASSEMBLY_TTL_SEC", "60"))
 WATERFALL_HISTORY_FRAMES = int(os.getenv("WATERFALL_HISTORY_FRAMES", "5"))
 NODE_TTL_SEC = int(os.getenv("NODE_TTL_SEC", str(6 * 60 * 60)))
@@ -47,7 +50,7 @@ ENTROPY_PERSIST_KEY_FILE = (
     else None
 )
 ENTROPY_PERSIST_INTERVAL_SEC = float(os.getenv("ENTROPY_PERSIST_INTERVAL_SEC", "5.0"))
-ENTROPY_PERSIST_ON_CONSUME = os.getenv("ENTROPY_PERSIST_ON_CONSUME", "1").lower() in (
+ENTROPY_PERSIST_ON_CONSUME = os.getenv("ENTROPY_PERSIST_ON_CONSUME", "0").lower() in (
     "1",
     "true",
     "yes",
@@ -262,7 +265,7 @@ def _write_entropy_checkpoint(snapshot: Optional[bytes] = None) -> bool:
     with entropy_checkpoint_lock:
         if snapshot is None:
             with pool_lock:
-                snapshot = bytes(entropy_pool)
+                snapshot = _entropy_checkpoint_snapshot_locked()
         try:
             ENTROPY_PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
             checkpoint_bytes = _pack_entropy_checkpoint(snapshot)
@@ -290,12 +293,18 @@ def _persist_after_consume_if_needed(snapshot: bytes):
         return True
 
 
+def _entropy_checkpoint_snapshot_locked() -> bytes:
+    max_bytes = max(1, min(ENTROPY_PERSIST_MAX_BYTES, POOL_MAX_BYTES))
+    return bytes(entropy_pool[-max_bytes:])
+
+
 def _clamp_pool():
     global entropy_pool
     margin = 10 * 1024 * 1024
     if len(entropy_pool) > POOL_MAX_BYTES + margin:
         excess = len(entropy_pool) - POOL_MAX_BYTES
         del entropy_pool[:excess]
+
 
 def _clamp_raw_pool():
     global raw_pool
@@ -387,7 +396,7 @@ def _pop_entropy_chunk(chunk_size: int) -> Optional[bytes]:
                     return None
                 data = bytes(entropy_pool[-chunk_size:])
                 del entropy_pool[-chunk_size:]
-                snapshot = bytes(entropy_pool)
+                snapshot = _entropy_checkpoint_snapshot_locked()
             if not _write_entropy_checkpoint(snapshot):
                 with pool_lock:
                     entropy_pool.extend(data)
@@ -400,7 +409,7 @@ def _pop_entropy_chunk(chunk_size: int) -> Optional[bytes]:
             return None
         data = bytes(entropy_pool[-chunk_size:])
         del entropy_pool[-chunk_size:]
-        snapshot = bytes(entropy_pool)
+        snapshot = _entropy_checkpoint_snapshot_locked()
     _persist_after_consume_if_needed(snapshot)
     return data
 
@@ -416,7 +425,7 @@ def _pop_entropy_chunk_up_to(chunk_size: int) -> Optional[bytes]:
                 actual_size = min(len(entropy_pool), chunk_size)
                 data = bytes(entropy_pool[-actual_size:])
                 del entropy_pool[-actual_size:]
-                snapshot = bytes(entropy_pool)
+                snapshot = _entropy_checkpoint_snapshot_locked()
             if not _write_entropy_checkpoint(snapshot):
                 with pool_lock:
                     entropy_pool.extend(data)
@@ -430,7 +439,7 @@ def _pop_entropy_chunk_up_to(chunk_size: int) -> Optional[bytes]:
         actual_size = min(len(entropy_pool), chunk_size)
         data = bytes(entropy_pool[-actual_size:])
         del entropy_pool[-actual_size:]
-        snapshot = bytes(entropy_pool)
+        snapshot = _entropy_checkpoint_snapshot_locked()
     _persist_after_consume_if_needed(snapshot)
     return data
 
@@ -1336,7 +1345,9 @@ def _start_background_threads():
         f"throttle_bytes_per_sec={THROTTLE_BYTES_PER_SEC}, "
         f"source_audit_repeat_score_threshold={SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD}, "
         f"entropy_persistence_enabled={_entropy_persistence_enabled()}, "
-        f"entropy_persist_path={ENTROPY_PERSIST_PATH})"
+        f"entropy_persist_path={ENTROPY_PERSIST_PATH}, "
+        f"entropy_persist_max_bytes={ENTROPY_PERSIST_MAX_BYTES}, "
+        f"entropy_persist_on_consume={ENTROPY_PERSIST_ON_CONSUME})"
     )
     threading.Thread(target=udp_receiver_worker, daemon=True).start()
     threading.Thread(target=telnet_server_worker, daemon=True).start()
