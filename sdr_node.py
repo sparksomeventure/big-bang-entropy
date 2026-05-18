@@ -1,6 +1,8 @@
 import base64
 import binascii
 import ctypes
+import argparse
+import gc
 import io
 import json
 import math
@@ -30,6 +32,14 @@ PLUTO_IP = os.getenv("PLUTO_IP", "192.168.2.1")
 FREQ = int(os.getenv("FREQ", "1420405000"))
 GAIN = int(os.getenv("GAIN", "70"))
 RX_CHANNEL = os.getenv("RX_CHANNEL", "voltage0")
+PLUTO_RX_CHANNEL_MODE = os.getenv("PLUTO_RX_CHANNEL_MODE", "iq").strip().lower()
+PLUTO_ALLOW_USB = os.getenv("PLUTO_ALLOW_USB", "0").lower() in ("1", "true", "yes")
+PLUTO_INIT_ATTEMPTS = max(1, int(os.getenv("PLUTO_INIT_ATTEMPTS", "3")))
+PLUTO_REINIT_ATTEMPTS = max(1, int(os.getenv("PLUTO_REINIT_ATTEMPTS", "3")))
+PLUTO_INIT_BACKOFF_BASE_SEC = float(os.getenv("PLUTO_INIT_BACKOFF_BASE_SEC", "5"))
+PLUTO_INIT_BACKOFF_MAX_SEC = float(os.getenv("PLUTO_INIT_BACKOFF_MAX_SEC", "45"))
+PLUTO_FAILURE_COOLDOWN_SEC = float(os.getenv("PLUTO_FAILURE_COOLDOWN_SEC", "90"))
+PLUTO_SOCKET_TIMEOUT_SEC = float(os.getenv("PLUTO_SOCKET_TIMEOUT_SEC", "3"))
 NODE_NAME = os.getenv("NODE_NAME", socket.gethostname())
 UDP_TARGET_HOST = os.getenv("UDP_TARGET_HOST", "generator")
 UDP_TARGET_PORT = int(os.getenv("UDP_TARGET_PORT", "5005"))
@@ -43,8 +53,12 @@ SOURCE_AUDIT_SAMPLE_BYTES = int(os.getenv("SOURCE_AUDIT_SAMPLE_BYTES", str(256 *
 LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
 SDR_TYPE = os.getenv("SDR_TYPE", "pluto").lower()
 RTL_SDR_INDEX = int(os.getenv("RTL_SDR_INDEX", "0"))
-SAMPLE_RATE = float(os.getenv("SAMPLE_RATE", "2.048e6"))
-PLUTO_BUFFER_SAMPLES = int(os.getenv("PLUTO_BUFFER_SAMPLES", "32768"))
+SAMPLE_RATE = float(os.getenv("SAMPLE_RATE", "3840000"))
+PLUTO_BUFFER_SAMPLES = int(os.getenv("PLUTO_BUFFER_SAMPLES", "2048"))
+PLUTO_MAX_INITIAL_BUFFER_SAMPLES = int(os.getenv("PLUTO_MAX_INITIAL_BUFFER_SAMPLES", "2048"))
+PLUTO_BUFFER_FALLBACK_SAMPLES = os.getenv("PLUTO_BUFFER_FALLBACK_SAMPLES", "1024,512,256")
+PLUTO_SAFE_SAMPLE_RATE_HZ = int(os.getenv("PLUTO_SAFE_SAMPLE_RATE_HZ", "2400000"))
+PLUTO_RF_BANDWIDTH_HZ = int(os.getenv("PLUTO_RF_BANDWIDTH_HZ", "0"))
 RTL_READ_BYTES = int(os.getenv("RTL_READ_BYTES", "262144"))
 DUMMY_READ_BYTES = int(os.getenv("DUMMY_READ_BYTES", str(32768 * 4)))
 DUMMY_SIGNAL_HZ = float(os.getenv("DUMMY_SIGNAL_HZ", "142000"))
@@ -147,6 +161,161 @@ class SDRSourceHandle:
         self.source = source
         self.ctx = ctx
         self.dev = dev
+
+
+class PlutoInitError(RuntimeError):
+    pass
+
+
+def pluto_step(step_name: str):
+    log(f"[*] Pluto init: {step_name}")
+
+
+def format_iio_error(exc: Exception) -> str:
+    message = str(exc)
+    errno_value = getattr(exc, "errno", None)
+    if errno_value is not None and f"[Errno {errno_value}]" not in message:
+        message = f"[Errno {exc.errno}] {message}"
+    return message
+
+
+def pluto_init_delay(attempt: int) -> float:
+    return min(PLUTO_INIT_BACKOFF_MAX_SEC, PLUTO_INIT_BACKOFF_BASE_SEC * (2 ** max(0, attempt - 1)))
+
+
+def parse_iio_available_numbers(value: str):
+    if not value:
+        return []
+    cleaned = value.replace("[", " ").replace("]", " ").replace(",", " ")
+    numbers = []
+    for part in cleaned.split():
+        try:
+            numbers.append(float(part))
+        except ValueError:
+            continue
+    return numbers
+
+
+def read_available_min(channel, attr_name: str):
+    available = channel.attrs.get(f"{attr_name}_available")
+    if available is None:
+        return None
+    try:
+        raw_value = available.value
+        numbers = parse_iio_available_numbers(raw_value)
+    except Exception as exc:
+        log(f"[!] Pluto init: could not read {attr_name}_available: {exc}")
+        return None
+    if raw_value.strip().startswith("[") and len(numbers) >= 3:
+        return int(numbers[0])
+    return int(min(numbers)) if numbers else None
+
+
+def choose_pluto_sample_rate(rx_channel):
+    requested = int(float(SAMPLE_RATE))
+    min_rate = read_available_min(rx_channel, "sampling_frequency")
+    if min_rate is None or requested >= min_rate:
+        return requested
+
+    adjusted = max(min_rate, PLUTO_SAFE_SAMPLE_RATE_HZ, requested)
+    log(
+        f"[!] SAMPLE_RATE={requested} is below Pluto minimum {min_rate}; "
+        f"using {adjusted} Hz instead."
+    )
+    return adjusted
+
+
+def parse_positive_int_list(value: str):
+    result = []
+    for part in value.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            parsed = int(part)
+        except ValueError:
+            continue
+        if parsed > 0:
+            result.append(parsed)
+    return result
+
+
+def pluto_buffer_candidates():
+    requested = max(128, int(PLUTO_BUFFER_SAMPLES))
+    initial_limit = max(128, int(PLUTO_MAX_INITIAL_BUFFER_SAMPLES))
+    first = min(requested, initial_limit)
+    candidates = [first]
+    for value in parse_positive_int_list(PLUTO_BUFFER_FALLBACK_SAMPLES):
+        value = max(128, min(int(value), initial_limit, requested))
+        if value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
+def effective_pluto_buffer_samples(attempt=1):
+    candidates = pluto_buffer_candidates()
+    selected = candidates[min(max(1, int(attempt)) - 1, len(candidates) - 1)]
+    requested = max(128, int(PLUTO_BUFFER_SAMPLES))
+    if selected != requested:
+        log(
+            f"[!] PLUTO_BUFFER_SAMPLES={requested} requested; using "
+            f"{selected} samples to reduce libiio/Pluto transport stress."
+        )
+    if selected > 8192:
+        log(
+            f"[!] Pluto RX buffer {selected} samples is larger than the conservative "
+            "clone-safe range. Prefer 2048 or 4096 if transport errors continue."
+        )
+    return selected
+
+
+def resolve_iio_uri():
+    pluto_uri = PLUTO_IP.strip()
+    if not pluto_uri or pluto_uri.lower() in ("local", "auto"):
+        raise PlutoInitError(
+            "PLUTO_IP=auto/local would trigger libiio auto-discovery. "
+            "Set PLUTO_IP=192.168.2.1 or PLUTO_ALLOW_USB=1 if you really need USB."
+        )
+    if pluto_uri.lower() in ("usb", "usb:"):
+        if not PLUTO_ALLOW_USB:
+            raise PlutoInitError("USB backend disabled; set PLUTO_IP=192.168.2.1 or PLUTO_ALLOW_USB=1")
+        return "usb:"
+    if "://" in pluto_uri:
+        return pluto_uri
+    if ":" not in pluto_uri:
+        return f"ip:{pluto_uri}"
+    return pluto_uri
+
+
+def iio_uri_host(uri: str):
+    if not uri.startswith("ip:"):
+        return None
+    host = uri[3:]
+    if ":" in host:
+        host = host.rsplit(":", 1)[0]
+    return host or None
+
+
+def pluto_socket_test(uri: str):
+    host = iio_uri_host(uri)
+    if host is None:
+        log(f"[*] Pluto diagnose: socket test skipped for non-IP URI {uri}")
+        return
+    pluto_step(f"socket test {host}:30431")
+    with socket.create_connection((host, 30431), timeout=PLUTO_SOCKET_TIMEOUT_SEC):
+        pass
+
+
+def pluto_enabled_rx_channels():
+    if PLUTO_RX_CHANNEL_MODE in ("i", "i_only", "single", "mono"):
+        return {RX_CHANNEL}
+    if RX_CHANNEL == "voltage1":
+        return {"voltage1"}
+    return {"voltage0", "voltage1"}
+
+
+def pluto_sample_frame_bytes():
+    return 2 if len(pluto_enabled_rx_channels()) == 1 else 4
 
 
 class DummySdr:
@@ -389,34 +558,58 @@ DISPLAY_FREQ_HZ = RADIO_FREQ_PLAN["display_freq_hz"]
 
 
 def build_iio_context():
-    if not PLUTO_IP or PLUTO_IP.lower() in ("local", "auto"):
-        log("[*] Searching for local/USB IIO context (auto-discovery)...")
-        return iio.Context()
-
-    if PLUTO_IP.lower() == "usb":
-        log("[*] Attempting to connect to IIO context: usb:")
-        return iio.Context("usb:")
-
-    uri = PLUTO_IP
-    if ":" not in uri:
-        # Default to IP if only an address/hostname is provided
-        uri = f"ip:{PLUTO_IP}"
-
-    log(f"[*] Attempting to connect to IIO context: {uri}")
+    uri = resolve_iio_uri()
+    pluto_step(f"create context {uri}")
     return iio.Context(uri)
 
 
 def configure_radio(ctx):
+    pluto_step("find ad9361-phy")
     phy = ctx.find_device("ad9361-phy")
-    phy.find_channel("altvoltage0", True).attrs["frequency"].value = str(TUNER_FREQ_HZ)
-    rx = phy.find_channel(RX_CHANNEL)
-    rx.attrs["sampling_frequency"].value = str(int(SAMPLE_RATE))
-    rx.attrs["gain_control_mode"].value = "manual"
-    rx.attrs["hardwaregain"].value = str(GAIN)
+    if phy is None:
+        raise PlutoInitError("IIO device ad9361-phy not found")
 
+    pluto_step("set LO frequency")
+    lo = phy.find_channel("altvoltage0", True)
+    if lo is None:
+        raise PlutoInitError("IIO output channel altvoltage0 not found on ad9361-phy")
+    lo.attrs["frequency"].value = str(TUNER_FREQ_HZ)
+
+    pluto_step(f"select RX channel {RX_CHANNEL}")
+    rx = phy.find_channel(RX_CHANNEL)
+    if rx is None:
+        raise PlutoInitError(f"IIO RX channel {RX_CHANNEL} not found on ad9361-phy")
+
+    sample_rate = choose_pluto_sample_rate(rx)
+    pluto_step(f"set sample rate {sample_rate}")
+    rx.attrs["sampling_frequency"].value = str(sample_rate)
+
+    if PLUTO_RF_BANDWIDTH_HZ > 0 and "rf_bandwidth" in rx.attrs:
+        rf_bandwidth = PLUTO_RF_BANDWIDTH_HZ
+    else:
+        rf_bandwidth = int(max(200000, min(sample_rate, sample_rate * 0.8)))
+    if "rf_bandwidth" in rx.attrs:
+        pluto_step(f"set RF bandwidth {rf_bandwidth}")
+        rx.attrs["rf_bandwidth"].value = str(rf_bandwidth)
+    else:
+        log("[!] Pluto init: RX channel has no rf_bandwidth attribute; leaving unchanged.")
+
+    pluto_step(f"set gain {GAIN}")
+    if "gain_control_mode" in rx.attrs:
+        rx.attrs["gain_control_mode"].value = "manual"
+    if "hardwaregain" in rx.attrs:
+        rx.attrs["hardwaregain"].value = str(GAIN)
+    else:
+        log("[!] Pluto init: RX channel has no hardwaregain attribute; leaving gain unchanged.")
+
+    pluto_step("find buffer device cf-ad9361-lpc")
     data_dev = ctx.find_device("cf-ad9361-lpc")
+    if data_dev is None:
+        raise PlutoInitError("IIO buffer-capable device cf-ad9361-lpc not found")
+    enabled_channels = pluto_enabled_rx_channels()
+    pluto_step(f"enable RX buffer channels {','.join(sorted(enabled_channels))}")
     for chan in data_dev.channels:
-        chan.enabled = True
+        chan.enabled = chan.id in enabled_channels
     return data_dev
 
 
@@ -494,16 +687,28 @@ def cleanup_sdr_source(source):
     if source is None:
         return
     source_obj = source.source if isinstance(source, SDRSourceHandle) else source
-    for method_name in ("cancel", "close", "destroy"):
-        method = getattr(source_obj, method_name, None)
-        if callable(method):
-            try:
-                method()
-            except Exception:
-                pass
+    cleanup_targets = [source_obj]
+    if isinstance(source, SDRSourceHandle):
+        cleanup_targets.extend([source.dev, source.ctx])
+
+    for target in cleanup_targets:
+        if target is None:
+            continue
+        for method_name in ("cancel", "close", "destroy"):
+            method = getattr(target, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    pass
+    if isinstance(source, SDRSourceHandle):
+        source.source = None
+        source.dev = None
+        source.ctx = None
+    gc.collect()
 
 
-def initialize_sdr_source():
+def initialize_sdr_source(init_attempt=1):
     if SDR_TYPE == "dummy":
         dummy = DummySdr(
             sample_rate=SAMPLE_RATE,
@@ -528,16 +733,19 @@ def initialize_sdr_source():
         log(f"[*] RTL-SDR successfully initialized: {sdr_obj}")
         return SDRSourceHandle(sdr_obj)
 
-    sdr_ctx = build_iio_context()
-    sdr_dev = configure_radio(sdr_ctx)
-    if PLUTO_BUFFER_SAMPLES > 32768:
-        log(
-            f"[!] PLUTO_BUFFER_SAMPLES={PLUTO_BUFFER_SAMPLES} may be unstable with libiio/Pluto transport. "
-            "If you see '[Errno 90] Message too long', try 32768."
-        )
-    sdr_buffer = iio.Buffer(sdr_dev, PLUTO_BUFFER_SAMPLES)
-    log(f"[*] PlutoSDR successfully initialized. Context: {sdr_ctx.name}")
-    return SDRSourceHandle(sdr_buffer, ctx=sdr_ctx, dev=sdr_dev)
+    sdr_ctx = None
+    sdr_dev = None
+    try:
+        sdr_ctx = build_iio_context()
+        sdr_dev = configure_radio(sdr_ctx)
+        buffer_samples = effective_pluto_buffer_samples(init_attempt)
+        pluto_step(f"create RX buffer {buffer_samples} samples")
+        sdr_buffer = iio.Buffer(sdr_dev, buffer_samples)
+        log(f"[*] PlutoSDR successfully initialized. Context: {sdr_ctx.name}")
+        return SDRSourceHandle(sdr_buffer, ctx=sdr_ctx, dev=sdr_dev)
+    except Exception:
+        cleanup_sdr_source(SDRSourceHandle(None, ctx=sdr_ctx, dev=sdr_dev))
+        raise
 
 
 def has_repetition_run(bits: np.ndarray, max_run_length: int) -> bool:
@@ -550,14 +758,24 @@ def has_repetition_run(bits: np.ndarray, max_run_length: int) -> bool:
 
 def reconnect_sdr_source(previous_source, reason):
     cleanup_sdr_source(previous_source)
-    for attempt in range(1, 11):
+    for attempt in range(1, PLUTO_REINIT_ATTEMPTS + 1):
         try:
-            log(f"[!] Reinitializing SDR after streaming failure ({reason}), attempt {attempt}/10...")
-            return initialize_sdr_source()
+            log(
+                f"[!] Reinitializing SDR after streaming failure ({reason}), "
+                f"attempt {attempt}/{PLUTO_REINIT_ATTEMPTS}..."
+            )
+            return initialize_sdr_source(init_attempt=attempt)
         except Exception as exc:
-            log(f"[!] SDR reinit attempt {attempt}/10 failed: {exc}")
-            time.sleep(min(30, attempt * 2))
-    log("[!] Fatal: Could not recover SDR stream after repeated reinit failures. Exiting.")
+            cleanup_sdr_source(None)
+            log(f"[!] SDR reinit attempt {attempt}/{PLUTO_REINIT_ATTEMPTS} failed: {format_iio_error(exc)}")
+            delay = pluto_init_delay(attempt)
+            log(f"[*] Waiting {delay:.1f}s before next SDR reinit attempt.")
+            time.sleep(delay)
+    log(
+        f"[!] Fatal: Could not recover SDR stream after {PLUTO_REINIT_ATTEMPTS} attempts. "
+        f"Cooling down for {PLUTO_FAILURE_COOLDOWN_SEC:.0f}s, then exiting."
+    )
+    time.sleep(PLUTO_FAILURE_COOLDOWN_SEC)
     os._exit(1)
 
 
@@ -571,18 +789,27 @@ def entropy_sender_worker(source):
         f"sample_packet_bytes={chunk_target}, decimation={ENTROPY_DECIMATION_FACTOR})"
     )
 
+    pluto_read_logged = False
     while True:
+        read_stage = "idle"
         try:
             if SDR_TYPE == "rtlsdr":
                 # read_bytes(n) returns bytes/bytearray for RTL-SDR
+                read_stage = "rtlsdr_read_sync"
                 raw_data = source.source.read_bytes(RTL_READ_BYTES)
             elif SDR_TYPE == "dummy":
+                read_stage = "dummy_read"
                 raw_data = source.source.read()
                 if DUMMY_READ_SLEEP_SEC > 0:
                     time.sleep(DUMMY_READ_SLEEP_SEC)
             else:
                 # buffer.refill() for PlutoSDR
+                if not pluto_read_logged:
+                    log("[*] Pluto stream: refill/read RX buffer")
+                    pluto_read_logged = True
+                read_stage = "pluto_buffer_refill"
                 source.source.refill()
+                read_stage = "pluto_buffer_read"
                 raw_data = source.source.read()
 
             update_latest_raw_iq(raw_data)
@@ -591,7 +818,7 @@ def entropy_sender_worker(source):
             # 1. Parse raw IQ samples
             dtype = np.uint8 if SDR_TYPE == "rtlsdr" else np.int16
             # Ensure we have a multiple of sample size (2 bytes for RTL, 4 for Pluto)
-            limit = len(raw_data) - (len(raw_data) % (2 if SDR_TYPE == "rtlsdr" else 4))
+            limit = len(raw_data) - (len(raw_data) % (2 if SDR_TYPE == "rtlsdr" else pluto_sample_frame_bytes()))
             samples = np.frombuffer(raw_data[:limit], dtype=dtype)
 
             # 2. Light decimation – configurable so weak nodes can be tuned
@@ -655,9 +882,10 @@ def entropy_sender_worker(source):
                     runtime_stats["sample_bytes_sent"] += len(chunk)
                     runtime_stats["last_sample_at"] = time.time()
         except Exception as exc:
-            log(f"[!] SDR streaming error: {exc}")
+            log(f"[!] SDR streaming error during {read_stage}: {format_iio_error(exc)}")
             entropy_accumulator.clear()
             source = reconnect_sdr_source(source, str(exc))
+            pluto_read_logged = False
             time.sleep(1)
 
 
@@ -807,7 +1035,10 @@ def waterfall_sender_worker():
                 # Center 8-bit unsigned (0..255) to avoid huge DC spike in FFT
                 iq = iq - 127.5
 
-            iq_complex = iq[0::2] + 1j * iq[1::2]
+            if SDR_TYPE == "pluto" and pluto_sample_frame_bytes() == 2:
+                iq_complex = iq.astype(np.complex64)
+            else:
+                iq_complex = iq[0::2] + 1j * iq[1::2]
 
             psd = np.abs(np.fft.fftshift(np.fft.fft(iq_complex))) ** 2
             psd_db = 10 * np.log10(psd + 1e-9)
@@ -1095,7 +1326,46 @@ def stats_logger_worker():
         )
 
 
-if __name__ == "__main__":
+def diagnose_pluto():
+    if SDR_TYPE != "pluto":
+        log(f"[!] --diagnose-pluto is intended for SDR_TYPE=pluto, current SDR_TYPE={SDR_TYPE}")
+    source = None
+    try:
+        uri = resolve_iio_uri()
+        pluto_socket_test(uri)
+        pluto_step(f"create context {uri}")
+        ctx = iio.Context(uri)
+        log(f"[*] Pluto diagnose: context created ({ctx.name})")
+        device_names = [dev.name or dev.id for dev in ctx.devices]
+        log(f"[*] Pluto diagnose: devices={', '.join(device_names)}")
+
+        dev = configure_radio(ctx)
+        buffer_samples = min(effective_pluto_buffer_samples(), 2048)
+        pluto_step(f"create RX buffer {buffer_samples} samples")
+        buf = iio.Buffer(dev, buffer_samples)
+        source = SDRSourceHandle(buf, ctx=ctx, dev=dev)
+
+        pluto_step("refill/read buffer")
+        buf.refill()
+        raw = buf.read()
+        log(f"[*] Pluto diagnose: read {len(raw)} bytes from RX buffer")
+        metrics = analyze_raw_signal(raw)
+        if metrics:
+            log(
+                "[*] Pluto diagnose: "
+                f"stddev={metrics['stddev']}, min={metrics['min_value']}, "
+                f"max={metrics['max_value']}, repeat_score={metrics['repeat_score']}"
+            )
+        log("[*] Pluto diagnose: OK")
+        return 0
+    except Exception as exc:
+        log(f"[!] Pluto diagnose failed: {format_iio_error(exc)}")
+        return 1
+    finally:
+        cleanup_sdr_source(source)
+
+
+def run_sdr_node():
     log(
         f"[*] SDR node {NODE_NAME} starting. Target: "
         f"{UDP_TARGET_HOST}:{UDP_TARGET_PORT}, Source type: {SDR_TYPE}"
@@ -1113,20 +1383,31 @@ if __name__ == "__main__":
     )
 
     # Give Pluto a moment to breathe after previous container restart
-    time.sleep(5)
+    if SDR_TYPE == "pluto":
+        time.sleep(5)
 
     # Main initialization loop - process won't start workers until hardware is ready
     sdr_source = None
-    for attempt in range(1, 11):
+    for attempt in range(1, PLUTO_INIT_ATTEMPTS + 1):
         try:
-            log(f"[*] SDR init attempt {attempt}/10 (Type: {SDR_TYPE})...")
-            sdr_source = initialize_sdr_source()
+            log(f"[*] SDR init attempt {attempt}/{PLUTO_INIT_ATTEMPTS} (Type: {SDR_TYPE})...")
+            sdr_source = initialize_sdr_source(init_attempt=attempt)
             break
         except Exception as exc:
-            log(f"[!] SDR init failed: {exc}")
-            time.sleep(10)
+            cleanup_sdr_source(sdr_source)
+            sdr_source = None
+            log(f"[!] SDR init failed: {format_iio_error(exc)}")
+            if attempt < PLUTO_INIT_ATTEMPTS:
+                delay = pluto_init_delay(attempt)
+                log(f"[*] Waiting {delay:.1f}s before next SDR init attempt.")
+                time.sleep(delay)
     else:
-        log("[!] Fatal: Could not initialize SDR after 10 attempts. Exiting.")
+        log(
+            f"[!] Fatal: Could not initialize SDR after {PLUTO_INIT_ATTEMPTS} attempts. "
+            f"Cooling down for {PLUTO_FAILURE_COOLDOWN_SEC:.0f}s, then exiting."
+        )
+        if SDR_TYPE == "pluto":
+            time.sleep(PLUTO_FAILURE_COOLDOWN_SEC)
         os._exit(1)
 
     # Start workers - pass the initialized source to the sampler thread
@@ -1138,3 +1419,20 @@ if __name__ == "__main__":
 
     while True:
         time.sleep(60)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Big Bang Entropy SDR node")
+    parser.add_argument(
+        "--diagnose-pluto",
+        action="store_true",
+        help="run a one-shot PlutoSDR IIO connectivity and small-buffer read test without UDP",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.diagnose_pluto:
+        raise SystemExit(diagnose_pluto())
+    run_sdr_node()
