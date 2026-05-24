@@ -50,6 +50,7 @@ WATERFALL_HISTORY_FRAMES = int(os.getenv("WATERFALL_HISTORY_FRAMES", "5"))
 WATERFALL_AXIS_WINDOW_SEC = int(os.getenv("WATERFALL_AXIS_WINDOW_SEC", "30"))
 SOURCE_AUDIT_INTERVAL_SEC = int(os.getenv("SOURCE_AUDIT_INTERVAL_SEC", str(24 * 60 * 60)))
 SOURCE_AUDIT_SAMPLE_BYTES = int(os.getenv("SOURCE_AUDIT_SAMPLE_BYTES", str(256 * 1024)))
+NODE_METRICS_INTERVAL_SEC = int(os.getenv("NODE_METRICS_INTERVAL_SEC", "30"))
 LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
 SDR_TYPE = os.getenv("SDR_TYPE", "pluto").lower()
 RTL_SDR_INDEX = int(os.getenv("RTL_SDR_INDEX", "0"))
@@ -79,15 +80,22 @@ runtime_stats = {
     "waterfalls_sent": 0,
     "waterfall_parts_sent": 0,
     "source_audits_sent": 0,
+    "health_rejected_packets": 0,
+    "rct_rejected_packets": 0,
+    "apt_rejected_packets": 0,
     "last_sample_at": 0.0,
     "last_waterfall_at": 0.0,
     "last_source_audit_at": 0.0,
+    "last_health_rejected_at": 0.0,
+    "last_signal_at": 0.0,
 }
 stats_lock = threading.Lock()
 latest_raw_iq = None
 latest_raw_iq_at = 0.0
 latest_raw_iq_lock = threading.Lock()
 latest_raw_iq_error_logged = False
+latest_signal_metrics = None
+latest_signal_metrics_lock = threading.Lock()
 waterfall_history = deque(maxlen=max(1, WATERFALL_HISTORY_FRAMES))
 axis_window_frames = max(2, int(math.ceil(max(1, WATERFALL_AXIS_WINDOW_SEC) / max(1, WATERFALL_INTERVAL_SEC))))
 waterfall_axis_metrics = deque(maxlen=axis_window_frames)
@@ -618,10 +626,57 @@ def udp_send(sock: socket.socket, message: dict):
     sock.sendto(payload, (UDP_TARGET_HOST, UDP_TARGET_PORT))
 
 
+def raw_signal_samples(raw_iq: bytes):
+    dtype = np.uint8 if SDR_TYPE == "rtlsdr" else np.int16
+    itemsize = np.dtype(dtype).itemsize
+    limit = len(raw_iq) - (len(raw_iq) % itemsize)
+    if limit <= 0:
+        return None, 0
+
+    samples = np.frombuffer(raw_iq[:limit], dtype=dtype).astype(np.float32)
+    if SDR_TYPE == "rtlsdr":
+        samples = samples - 127.5
+    return samples, limit
+
+
+def summarize_raw_signal(raw_iq: bytes):
+    samples, limit = raw_signal_samples(raw_iq)
+    if samples is None or samples.size < 2:
+        return None
+
+    return {
+        "sample_bytes": int(limit),
+        "sample_count": int(samples.size),
+        "mean": round(float(np.mean(samples)), 4),
+        "abs_mean": round(float(np.mean(np.abs(samples))), 4),
+        "stddev": round(float(np.std(samples)), 4),
+        "min_value": round(float(samples.min()), 4),
+        "max_value": round(float(samples.max()), 4),
+    }
+
+
+def update_latest_signal_metrics(raw_iq: bytes):
+    global latest_signal_metrics
+    metrics = summarize_raw_signal(raw_iq)
+    if metrics is None:
+        return
+    metrics["captured_at"] = time.time()
+    with latest_signal_metrics_lock:
+        latest_signal_metrics = metrics
+    with stats_lock:
+        runtime_stats["last_signal_at"] = metrics["captured_at"]
+
+
+def get_latest_signal_metrics():
+    with latest_signal_metrics_lock:
+        if latest_signal_metrics is None:
+            return None
+        return dict(latest_signal_metrics)
+
+
 def analyze_raw_signal(raw_iq: bytes):
-    limit = len(raw_iq) - (len(raw_iq) % 2)
-    samples = np.frombuffer(raw_iq[:limit], dtype=np.int16)
-    if samples.size < 2:
+    samples, limit = raw_signal_samples(raw_iq)
+    if samples is None or samples.size < 2:
         return None
 
     sample_count = int(samples.size)
@@ -813,6 +868,7 @@ def entropy_sender_worker(source):
                 raw_data = source.source.read()
 
             update_latest_raw_iq(raw_data)
+            update_latest_signal_metrics(raw_data)
 
             # --- OPTIMIZED DSP PIPELINE (multi-bit XOR-fold + Von Neumann) ---
             # 1. Parse raw IQ samples
@@ -845,6 +901,10 @@ def entropy_sender_worker(source):
             if len(extracted_bits) > 32:
                 if has_repetition_run(extracted_bits, 32):
                     log("[!] Health Check Failed: RCT (long run detected). Dropping packet.")
+                    with stats_lock:
+                        runtime_stats["health_rejected_packets"] += 1
+                        runtime_stats["rct_rejected_packets"] += 1
+                        runtime_stats["last_health_rejected_at"] = time.time()
                     continue
 
             # APT: Adaptive Proportion Test (checks for strong bias in a window)
@@ -854,6 +914,10 @@ def entropy_sender_worker(source):
                 ones = np.sum(window)
                 if ones < 112 or ones > 400: # Approx 0.22 to 0.78 proportion
                     log(f"[!] Health Check Failed: APT (bias detected: {ones}/512 ones). Dropping packet.")
+                    with stats_lock:
+                        runtime_stats["health_rejected_packets"] += 1
+                        runtime_stats["apt_rejected_packets"] += 1
+                        runtime_stats["last_health_rejected_at"] = time.time()
                     continue
 
             # 6. Pack bits into bytes and accumulate
@@ -1249,6 +1313,32 @@ def source_audit_worker():
             time.sleep(5)
 
 
+def node_metrics_worker():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    log(
+        f"[*] Node metrics worker ready (node={NODE_NAME}, interval={NODE_METRICS_INTERVAL_SEC}s)"
+    )
+
+    while True:
+        try:
+            time.sleep(max(1, NODE_METRICS_INTERVAL_SEC))
+            with stats_lock:
+                snapshot = dict(runtime_stats)
+            signal = get_latest_signal_metrics()
+            message = {
+                "type": "node_metrics",
+                "node": NODE_NAME,
+                "timestamp": time.time(),
+                "stats": snapshot,
+            }
+            if signal is not None:
+                message["signal"] = signal
+            udp_send(sock, message)
+        except Exception as exc:
+            log(f"[!] Node metrics send error: {exc}")
+            time.sleep(5)
+
+
 def status_poller_worker():
     safe_node_name = urllib.parse.quote(NODE_NAME)
     
@@ -1312,17 +1402,24 @@ def stats_logger_worker():
             if snapshot["last_source_audit_at"]
             else None
         )
+        last_signal_age = (
+            round(time.time() - snapshot["last_signal_at"], 1)
+            if snapshot["last_signal_at"]
+            else None
+        )
         log(
             "[*] SDR node stats: "
             f"node={NODE_NAME}, "
             f"sample_packets_sent={snapshot['sample_packets_sent']}, "
             f"sample_bytes_sent={snapshot['sample_bytes_sent']}, "
+            f"health_rejected_packets={snapshot['health_rejected_packets']}, "
             f"waterfalls_sent={snapshot['waterfalls_sent']}, "
             f"waterfall_parts_sent={snapshot['waterfall_parts_sent']}, "
             f"source_audits_sent={snapshot['source_audits_sent']}, "
             f"last_sample_age_sec={last_sample_age}, "
             f"last_waterfall_age_sec={last_waterfall_age}, "
-            f"last_source_audit_age_sec={last_source_audit_age}"
+            f"last_source_audit_age_sec={last_source_audit_age}, "
+            f"last_signal_age_sec={last_signal_age}"
         )
 
 
@@ -1414,6 +1511,7 @@ def run_sdr_node():
     threading.Thread(target=entropy_sender_worker, args=(sdr_source,), daemon=True).start()
     threading.Thread(target=waterfall_sender_worker, daemon=True).start()
     threading.Thread(target=source_audit_worker, daemon=True).start()
+    threading.Thread(target=node_metrics_worker, daemon=True).start()
     threading.Thread(target=status_poller_worker, daemon=True).start()
     threading.Thread(target=stats_logger_worker, daemon=True).start()
 

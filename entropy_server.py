@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import socket
+import sqlite3
 import string
 import threading
 import time
@@ -85,6 +86,21 @@ AUTOSTART_THREADS = os.getenv("ENTROPY_SERVER_AUTOSTART_THREADS", "1").lower() i
     "true",
     "yes",
 )
+METRICS_ENABLED = os.getenv("METRICS_ENABLED", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+METRICS_DB_PATH_VALUE = os.getenv("METRICS_DB_PATH", "/tmp/bbe-metrics.sqlite3")
+METRICS_DB_PATH = (
+    Path(METRICS_DB_PATH_VALUE).expanduser() if METRICS_DB_PATH_VALUE else None
+)
+METRICS_BUCKET_SEC = max(60, int(os.getenv("METRICS_BUCKET_SEC", "300")))
+METRICS_FLUSH_INTERVAL_SEC = max(
+    1.0, float(os.getenv("METRICS_FLUSH_INTERVAL_SEC", "15.0"))
+)
+METRICS_RETENTION_DAYS = max(1, int(os.getenv("METRICS_RETENTION_DAYS", "90")))
+METRICS_DEFAULT_RANGE_SEC = int(os.getenv("METRICS_DEFAULT_RANGE_SEC", str(24 * 60 * 60)))
 
 entropy_pool = bytearray()
 pool_lock = threading.Lock()
@@ -107,13 +123,434 @@ generator_state_lock = threading.Lock()
 
 node_stats: Dict[str, Dict[str, object]] = {}
 node_stats_lock = threading.Lock()
+node_runtime_stats: Dict[str, Dict[str, object]] = {}
+node_runtime_stats_lock = threading.Lock()
 
 source_audits: Dict[str, Dict[str, object]] = {}
 source_audits_lock = threading.Lock()
 
+metrics_node_buckets: Dict[tuple[int, str], Dict[str, object]] = {}
+metrics_system_buckets: Dict[int, Dict[str, object]] = {}
+metrics_lock = threading.Lock()
+metrics_db_lock = threading.Lock()
+metrics_db_initialized_path: Optional[str] = None
+
 
 def log(message: str):
     print(message, flush=True)
+
+
+def _metrics_enabled() -> bool:
+    return METRICS_ENABLED and METRICS_DB_PATH is not None
+
+
+def _metrics_bucket_start(timestamp: Optional[float] = None) -> int:
+    timestamp = time.time() if timestamp is None else float(timestamp)
+    return int(timestamp // METRICS_BUCKET_SEC * METRICS_BUCKET_SEC)
+
+
+def _empty_node_metric_bucket(bucket_start: int, node_name: str) -> Dict[str, object]:
+    return {
+        "bucket_start": bucket_start,
+        "node": node_name,
+        "sample_packets": 0,
+        "sample_bytes": 0,
+        "rejected_packets": 0,
+        "rejected_bytes": 0,
+        "signal_mean_sum": 0.0,
+        "signal_mean_weight": 0.0,
+        "signal_abs_mean_sum": 0.0,
+        "signal_abs_mean_weight": 0.0,
+        "signal_stddev_sum": 0.0,
+        "signal_stddev_weight": 0.0,
+        "audit_repeat_score_sum": 0.0,
+        "audit_repeat_score_count": 0,
+        "updated_at": time.time(),
+    }
+
+
+def _empty_system_metric_bucket(bucket_start: int) -> Dict[str, object]:
+    return {
+        "bucket_start": bucket_start,
+        "pool_bytes_sum": 0.0,
+        "pool_fill_pct_sum": 0.0,
+        "source_nodes_sum": 0.0,
+        "rejecting_nodes_sum": 0.0,
+        "waterfall_nodes_sum": 0.0,
+        "sample_count": 0,
+        "updated_at": time.time(),
+    }
+
+
+def _optional_float(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed:
+        return None
+    return parsed
+
+
+def _optional_int(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_node_metric(
+    node_name: str,
+    *,
+    timestamp: Optional[float] = None,
+    sample_packets: int = 0,
+    sample_bytes: int = 0,
+    rejected_packets: int = 0,
+    rejected_bytes: int = 0,
+    signal_mean: Optional[float] = None,
+    signal_abs_mean: Optional[float] = None,
+    signal_stddev: Optional[float] = None,
+    signal_sample_count: Optional[int] = None,
+    audit_repeat_score: Optional[float] = None,
+):
+    if not _metrics_enabled() or not node_name:
+        return
+
+    safe_node = str(node_name)[:128]
+    bucket_start = _metrics_bucket_start(timestamp)
+    key = (bucket_start, safe_node)
+    signal_weight = max(float(signal_sample_count or 1), 1.0)
+
+    with metrics_lock:
+        bucket = metrics_node_buckets.setdefault(
+            key,
+            _empty_node_metric_bucket(bucket_start, safe_node),
+        )
+        bucket["sample_packets"] += max(0, int(sample_packets))
+        bucket["sample_bytes"] += max(0, int(sample_bytes))
+        bucket["rejected_packets"] += max(0, int(rejected_packets))
+        bucket["rejected_bytes"] += max(0, int(rejected_bytes))
+
+        parsed_signal_mean = _optional_float(signal_mean)
+        if parsed_signal_mean is not None:
+            bucket["signal_mean_sum"] += parsed_signal_mean * signal_weight
+            bucket["signal_mean_weight"] += signal_weight
+
+        parsed_signal_abs_mean = _optional_float(signal_abs_mean)
+        if parsed_signal_abs_mean is not None:
+            bucket["signal_abs_mean_sum"] += parsed_signal_abs_mean * signal_weight
+            bucket["signal_abs_mean_weight"] += signal_weight
+
+        parsed_signal_stddev = _optional_float(signal_stddev)
+        if parsed_signal_stddev is not None:
+            bucket["signal_stddev_sum"] += parsed_signal_stddev * signal_weight
+            bucket["signal_stddev_weight"] += signal_weight
+
+        parsed_repeat_score = _optional_float(audit_repeat_score)
+        if parsed_repeat_score is not None:
+            bucket["audit_repeat_score_sum"] += parsed_repeat_score
+            bucket["audit_repeat_score_count"] += 1
+
+        bucket["updated_at"] = time.time()
+
+
+def _record_system_metrics_snapshot(timestamp: Optional[float] = None):
+    if not _metrics_enabled():
+        return
+
+    _cleanup_stale_nodes()
+    now = time.time() if timestamp is None else float(timestamp)
+    bucket_start = _metrics_bucket_start(now)
+    with pool_lock:
+        pool_bytes = len(entropy_pool)
+    pool_fill_pct = (pool_bytes / POOL_MAX_BYTES * 100.0) if POOL_MAX_BYTES else 0.0
+    with node_stats_lock:
+        source_nodes = len(node_stats)
+    with waterfalls_lock:
+        waterfall_nodes = len(waterfalls)
+    with source_audits_lock:
+        audit_snapshot = [dict(state) for state in source_audits.values()]
+    rejecting_nodes = sum(
+        1
+        for audit in audit_snapshot
+        if not _source_audit_summary(audit, now=now)["accepting_samples"]
+    )
+
+    with metrics_lock:
+        bucket = metrics_system_buckets.setdefault(
+            bucket_start,
+            _empty_system_metric_bucket(bucket_start),
+        )
+        bucket["pool_bytes_sum"] += pool_bytes
+        bucket["pool_fill_pct_sum"] += pool_fill_pct
+        bucket["source_nodes_sum"] += source_nodes
+        bucket["rejecting_nodes_sum"] += rejecting_nodes
+        bucket["waterfall_nodes_sum"] += waterfall_nodes
+        bucket["sample_count"] += 1
+        bucket["updated_at"] = time.time()
+
+
+def _connect_metrics_db():
+    if METRICS_DB_PATH is None:
+        raise RuntimeError("metrics DB path is not configured")
+    METRICS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(METRICS_DB_PATH), timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def _init_metrics_db() -> bool:
+    global metrics_db_initialized_path
+    if not _metrics_enabled():
+        return False
+
+    path_key = str(METRICS_DB_PATH)
+    with metrics_db_lock:
+        if metrics_db_initialized_path == path_key:
+            return True
+        try:
+            with _connect_metrics_db() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS node_metric_buckets (
+                        bucket_start INTEGER NOT NULL,
+                        node TEXT NOT NULL,
+                        sample_packets INTEGER NOT NULL DEFAULT 0,
+                        sample_bytes INTEGER NOT NULL DEFAULT 0,
+                        rejected_packets INTEGER NOT NULL DEFAULT 0,
+                        rejected_bytes INTEGER NOT NULL DEFAULT 0,
+                        signal_mean_sum REAL NOT NULL DEFAULT 0,
+                        signal_mean_weight REAL NOT NULL DEFAULT 0,
+                        signal_abs_mean_sum REAL NOT NULL DEFAULT 0,
+                        signal_abs_mean_weight REAL NOT NULL DEFAULT 0,
+                        signal_stddev_sum REAL NOT NULL DEFAULT 0,
+                        signal_stddev_weight REAL NOT NULL DEFAULT 0,
+                        audit_repeat_score_sum REAL NOT NULL DEFAULT 0,
+                        audit_repeat_score_count INTEGER NOT NULL DEFAULT 0,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (bucket_start, node)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS system_metric_buckets (
+                        bucket_start INTEGER PRIMARY KEY,
+                        pool_bytes_sum REAL NOT NULL DEFAULT 0,
+                        pool_fill_pct_sum REAL NOT NULL DEFAULT 0,
+                        source_nodes_sum REAL NOT NULL DEFAULT 0,
+                        rejecting_nodes_sum REAL NOT NULL DEFAULT 0,
+                        waterfall_nodes_sum REAL NOT NULL DEFAULT 0,
+                        sample_count INTEGER NOT NULL DEFAULT 0,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_node_metric_buckets_node_time "
+                    "ON node_metric_buckets(node, bucket_start)"
+                )
+            metrics_db_initialized_path = path_key
+            return True
+        except Exception as exc:
+            log(f"[!] Could not initialize metrics DB at {METRICS_DB_PATH}: {exc}")
+            return False
+
+
+def _flush_metrics_to_db() -> bool:
+    if not _metrics_enabled():
+        return False
+
+    _record_system_metrics_snapshot()
+
+    with metrics_lock:
+        node_rows = [dict(row) for row in metrics_node_buckets.values()]
+        system_rows = [dict(row) for row in metrics_system_buckets.values()]
+        metrics_node_buckets.clear()
+        metrics_system_buckets.clear()
+
+    if not node_rows and not system_rows:
+        return True
+    if not _init_metrics_db():
+        return False
+
+    now = time.time()
+    cutoff_bucket = _metrics_bucket_start(now - (METRICS_RETENTION_DAYS * 24 * 60 * 60))
+    try:
+        with metrics_db_lock:
+            with _connect_metrics_db() as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO node_metric_buckets (
+                        bucket_start,
+                        node,
+                        sample_packets,
+                        sample_bytes,
+                        rejected_packets,
+                        rejected_bytes,
+                        signal_mean_sum,
+                        signal_mean_weight,
+                        signal_abs_mean_sum,
+                        signal_abs_mean_weight,
+                        signal_stddev_sum,
+                        signal_stddev_weight,
+                        audit_repeat_score_sum,
+                        audit_repeat_score_count,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(bucket_start, node) DO UPDATE SET
+                        sample_packets = sample_packets + excluded.sample_packets,
+                        sample_bytes = sample_bytes + excluded.sample_bytes,
+                        rejected_packets = rejected_packets + excluded.rejected_packets,
+                        rejected_bytes = rejected_bytes + excluded.rejected_bytes,
+                        signal_mean_sum = signal_mean_sum + excluded.signal_mean_sum,
+                        signal_mean_weight = signal_mean_weight + excluded.signal_mean_weight,
+                        signal_abs_mean_sum = signal_abs_mean_sum + excluded.signal_abs_mean_sum,
+                        signal_abs_mean_weight = signal_abs_mean_weight + excluded.signal_abs_mean_weight,
+                        signal_stddev_sum = signal_stddev_sum + excluded.signal_stddev_sum,
+                        signal_stddev_weight = signal_stddev_weight + excluded.signal_stddev_weight,
+                        audit_repeat_score_sum = audit_repeat_score_sum + excluded.audit_repeat_score_sum,
+                        audit_repeat_score_count = audit_repeat_score_count + excluded.audit_repeat_score_count,
+                        updated_at = excluded.updated_at
+                    """,
+                    [
+                        (
+                            row["bucket_start"],
+                            row["node"],
+                            row["sample_packets"],
+                            row["sample_bytes"],
+                            row["rejected_packets"],
+                            row["rejected_bytes"],
+                            row["signal_mean_sum"],
+                            row["signal_mean_weight"],
+                            row["signal_abs_mean_sum"],
+                            row["signal_abs_mean_weight"],
+                            row["signal_stddev_sum"],
+                            row["signal_stddev_weight"],
+                            row["audit_repeat_score_sum"],
+                            row["audit_repeat_score_count"],
+                            now,
+                            row["updated_at"],
+                        )
+                        for row in node_rows
+                    ],
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO system_metric_buckets (
+                        bucket_start,
+                        pool_bytes_sum,
+                        pool_fill_pct_sum,
+                        source_nodes_sum,
+                        rejecting_nodes_sum,
+                        waterfall_nodes_sum,
+                        sample_count,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(bucket_start) DO UPDATE SET
+                        pool_bytes_sum = pool_bytes_sum + excluded.pool_bytes_sum,
+                        pool_fill_pct_sum = pool_fill_pct_sum + excluded.pool_fill_pct_sum,
+                        source_nodes_sum = source_nodes_sum + excluded.source_nodes_sum,
+                        rejecting_nodes_sum = rejecting_nodes_sum + excluded.rejecting_nodes_sum,
+                        waterfall_nodes_sum = waterfall_nodes_sum + excluded.waterfall_nodes_sum,
+                        sample_count = sample_count + excluded.sample_count,
+                        updated_at = excluded.updated_at
+                    """,
+                    [
+                        (
+                            row["bucket_start"],
+                            row["pool_bytes_sum"],
+                            row["pool_fill_pct_sum"],
+                            row["source_nodes_sum"],
+                            row["rejecting_nodes_sum"],
+                            row["waterfall_nodes_sum"],
+                            row["sample_count"],
+                            now,
+                            row["updated_at"],
+                        )
+                        for row in system_rows
+                    ],
+                )
+                conn.execute(
+                    "DELETE FROM node_metric_buckets WHERE bucket_start < ?",
+                    (cutoff_bucket,),
+                )
+                conn.execute(
+                    "DELETE FROM system_metric_buckets WHERE bucket_start < ?",
+                    (cutoff_bucket,),
+                )
+            return True
+    except Exception as exc:
+        log(f"[!] Could not flush metrics DB at {METRICS_DB_PATH}: {exc}")
+        return False
+
+
+def _parse_statistics_range_seconds(value: Optional[str]) -> int:
+    if not value:
+        return METRICS_DEFAULT_RANGE_SEC
+
+    raw = str(value).strip().lower()
+    units = {"m": 60, "h": 60 * 60, "d": 24 * 60 * 60}
+    if raw[-1:] in units:
+        try:
+            seconds = int(float(raw[:-1]) * units[raw[-1]])
+        except ValueError:
+            return METRICS_DEFAULT_RANGE_SEC
+    else:
+        try:
+            seconds = int(raw)
+        except ValueError:
+            return METRICS_DEFAULT_RANGE_SEC
+
+    max_seconds = METRICS_RETENTION_DAYS * 24 * 60 * 60
+    return max(METRICS_BUCKET_SEC, min(seconds, max_seconds))
+
+
+def _safe_average(total: float, weight: float) -> Optional[float]:
+    if not weight:
+        return None
+    return round(float(total) / float(weight), 4)
+
+
+def _build_node_metric_point(row, bucket_step: int) -> Dict[str, object]:
+    sample_packets = int(row["sample_packets"] or 0)
+    sample_bytes = int(row["sample_bytes"] or 0)
+    rejected_packets = int(row["rejected_packets"] or 0)
+    rejected_bytes = int(row["rejected_bytes"] or 0)
+    return {
+        "sample_packets": sample_packets,
+        "sample_bytes": sample_bytes,
+        "rejected_packets": rejected_packets,
+        "rejected_bytes": rejected_bytes,
+        "throughput_bytes_per_sec": round(sample_bytes / max(1, bucket_step), 2),
+        "avg_signal": _safe_average(
+            row["signal_mean_sum"] or 0.0,
+            row["signal_mean_weight"] or 0.0,
+        ),
+        "avg_abs_signal": _safe_average(
+            row["signal_abs_mean_sum"] or 0.0,
+            row["signal_abs_mean_weight"] or 0.0,
+        ),
+        "avg_signal_stddev": _safe_average(
+            row["signal_stddev_sum"] or 0.0,
+            row["signal_stddev_weight"] or 0.0,
+        ),
+        "avg_repeat_score": _safe_average(
+            row["audit_repeat_score_sum"] or 0.0,
+            row["audit_repeat_score_count"] or 0.0,
+        ),
+    }
 
 
 def _entropy_persistence_enabled() -> bool:
@@ -573,6 +1010,35 @@ def _update_node_stats(node_name: str, raw_bytes: int, payload_bytes: int, rejec
             state["payload_bytes"] += payload_bytes
             state["packets"] += 1
         state["last_seen"] = time.time()
+    if rejected:
+        _record_node_metric(
+            node_name,
+            rejected_packets=1,
+            rejected_bytes=max(0, int(raw_bytes)),
+        )
+    else:
+        _record_node_metric(
+            node_name,
+            sample_packets=1,
+            sample_bytes=max(0, int(raw_bytes)),
+        )
+
+
+def _touch_node_stats(node_name: str):
+    with node_stats_lock:
+        state = node_stats.setdefault(
+            node_name,
+            {
+                "first_seen": time.time(),
+                "raw_bytes": 0,
+                "payload_bytes": 0,
+                "packets": 0,
+                "rejected_packets": 0,
+                "rejected_bytes": 0,
+                "last_seen": 0.0,
+            },
+        )
+        state["last_seen"] = time.time()
 
 
 def _cleanup_stale_nodes(now: Optional[float] = None):
@@ -785,11 +1251,77 @@ def _handle_source_audit(message: dict):
     audit_payload["accepting_samples"] = summary["accepting_samples"]
     audit_payload["repeat_score_threshold"] = SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD
     _update_source_audit(node_name, audit_payload)
+    _record_node_metric(
+        node_name,
+        timestamp=updated_at,
+        signal_mean=audit_payload["mean"],
+        signal_abs_mean=abs(audit_payload["mean"]),
+        signal_stddev=audit_payload["stddev"],
+        signal_sample_count=audit_payload["sample_count"],
+        audit_repeat_score=audit_payload["repeat_score"],
+    )
     log(
         f"[*] Source audit updated for node={node_name} "
         f"(repeat_score={audit_payload['repeat_score']:.4f}, "
         f"accepting_samples={audit_payload['accepting_samples']})"
     )
+
+
+def _counter_delta(current_value, previous_value) -> int:
+    current = _optional_int(current_value) or 0
+    previous = _optional_int(previous_value)
+    if previous is None:
+        return 0
+    if current < previous:
+        return max(0, current)
+    return max(0, current - previous)
+
+
+def _handle_node_metrics(message: dict):
+    node_name = message.get("node")
+    if not node_name:
+        return
+
+    stats = message.get("stats") if isinstance(message.get("stats"), dict) else {}
+    signal = message.get("signal") if isinstance(message.get("signal"), dict) else {}
+    timestamp = _optional_float(message.get("timestamp")) or time.time()
+    _touch_node_stats(node_name)
+
+    with node_runtime_stats_lock:
+        previous = node_runtime_stats.setdefault(node_name, {})
+        health_rejected_delta = _counter_delta(
+            stats.get("health_rejected_packets"),
+            previous.get("health_rejected_packets"),
+        )
+        previous.update(
+            {
+                "updated_at": time.time(),
+                "sample_packets_sent": _optional_int(stats.get("sample_packets_sent")) or 0,
+                "sample_bytes_sent": _optional_int(stats.get("sample_bytes_sent")) or 0,
+                "waterfalls_sent": _optional_int(stats.get("waterfalls_sent")) or 0,
+                "source_audits_sent": _optional_int(stats.get("source_audits_sent")) or 0,
+                "health_rejected_packets": _optional_int(stats.get("health_rejected_packets")) or 0,
+                "rct_rejected_packets": _optional_int(stats.get("rct_rejected_packets")) or 0,
+                "apt_rejected_packets": _optional_int(stats.get("apt_rejected_packets")) or 0,
+            }
+        )
+
+    if health_rejected_delta:
+        _record_node_metric(
+            node_name,
+            timestamp=timestamp,
+            rejected_packets=health_rejected_delta,
+        )
+
+    if signal:
+        _record_node_metric(
+            node_name,
+            timestamp=timestamp,
+            signal_mean=_optional_float(signal.get("mean")),
+            signal_abs_mean=_optional_float(signal.get("abs_mean")),
+            signal_stddev=_optional_float(signal.get("stddev")),
+            signal_sample_count=_optional_int(signal.get("sample_count")),
+        )
 
 
 def udp_receiver_worker():
@@ -826,6 +1358,8 @@ def udp_receiver_worker():
             _handle_waterfall_part(message)
         elif msg_type == "source_audit":
             _handle_source_audit(message)
+        elif msg_type == "node_metrics":
+            _handle_node_metrics(message)
 
 
 def telnet_client_worker(conn: socket.socket, address):
@@ -1001,6 +1535,9 @@ def healthz():
             "entropy_persist_on_consume": ENTROPY_PERSIST_ON_CONSUME,
             "entropy_rekey_restored_pool": ENTROPY_REKEY_RESTORED_POOL,
             "last_entropy_checkpoint_at": last_entropy_checkpoint_at or None,
+            "metrics_enabled": _metrics_enabled(),
+            "metrics_bucket_seconds": METRICS_BUCKET_SEC,
+            "metrics_retention_days": METRICS_RETENTION_DAYS,
         }
     )
 
@@ -1104,6 +1641,284 @@ def list_source_audits():
             item["age_sec"] = round(now - state["updated_at"], 1) if state.get("updated_at") else None
             payload.append(item)
     return jsonify(payload)
+
+
+def _statistics_node_filter():
+    node = (request.args.get("node") or "").strip()
+    if not node or node.lower() == "all":
+        return None
+    return node[:128]
+
+
+def _query_metric_nodes(start_bucket: int):
+    if not _init_metrics_db():
+        return []
+    try:
+        with metrics_db_lock:
+            with _connect_metrics_db() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT node
+                    FROM node_metric_buckets
+                    WHERE bucket_start >= ?
+                    ORDER BY node
+                    """,
+                    (start_bucket,),
+                ).fetchall()
+        return [row[0] for row in rows]
+    except Exception as exc:
+        log(f"[!] Could not query metric nodes: {exc}")
+        return []
+
+
+def _query_statistics_points(range_seconds: int, node_filter: Optional[str]):
+    _flush_metrics_to_db()
+
+    now = time.time()
+    end_bucket = _metrics_bucket_start(now)
+    start_bucket = _metrics_bucket_start(now - range_seconds)
+    bucket_step = METRICS_BUCKET_SEC
+
+    node_where = "bucket_start BETWEEN ? AND ?"
+    params = [start_bucket, end_bucket]
+    if node_filter:
+        node_where += " AND node = ?"
+        params.append(node_filter)
+
+    node_rows = {}
+    per_node_rows: Dict[int, Dict[str, Dict[str, object]]] = {}
+    system_rows = {}
+    if _init_metrics_db():
+        try:
+            with metrics_db_lock:
+                with _connect_metrics_db() as conn:
+                    conn.row_factory = sqlite3.Row
+                    for row in conn.execute(
+                        f"""
+                        SELECT
+                            bucket_start,
+                            SUM(sample_packets) AS sample_packets,
+                            SUM(sample_bytes) AS sample_bytes,
+                            SUM(rejected_packets) AS rejected_packets,
+                            SUM(rejected_bytes) AS rejected_bytes,
+                            SUM(signal_mean_sum) AS signal_mean_sum,
+                            SUM(signal_mean_weight) AS signal_mean_weight,
+                            SUM(signal_abs_mean_sum) AS signal_abs_mean_sum,
+                            SUM(signal_abs_mean_weight) AS signal_abs_mean_weight,
+                            SUM(signal_stddev_sum) AS signal_stddev_sum,
+                            SUM(signal_stddev_weight) AS signal_stddev_weight,
+                            SUM(audit_repeat_score_sum) AS audit_repeat_score_sum,
+                            SUM(audit_repeat_score_count) AS audit_repeat_score_count
+                        FROM node_metric_buckets
+                        WHERE {node_where}
+                        GROUP BY bucket_start
+                        ORDER BY bucket_start
+                        """,
+                        params,
+                    ):
+                        node_rows[int(row[0])] = row
+
+                    for row in conn.execute(
+                        f"""
+                        SELECT
+                            bucket_start,
+                            node,
+                            sample_packets,
+                            sample_bytes,
+                            rejected_packets,
+                            rejected_bytes,
+                            signal_mean_sum,
+                            signal_mean_weight,
+                            signal_abs_mean_sum,
+                            signal_abs_mean_weight,
+                            signal_stddev_sum,
+                            signal_stddev_weight,
+                            audit_repeat_score_sum,
+                            audit_repeat_score_count
+                        FROM node_metric_buckets
+                        WHERE {node_where}
+                        ORDER BY bucket_start, node
+                        """,
+                        params,
+                    ):
+                        bucket_nodes = per_node_rows.setdefault(int(row["bucket_start"]), {})
+                        bucket_nodes[str(row["node"])] = _build_node_metric_point(row, bucket_step)
+
+                    for row in conn.execute(
+                        """
+                        SELECT
+                            bucket_start,
+                            pool_bytes_sum,
+                            pool_fill_pct_sum,
+                            source_nodes_sum,
+                            rejecting_nodes_sum,
+                            waterfall_nodes_sum,
+                            sample_count
+                        FROM system_metric_buckets
+                        WHERE bucket_start BETWEEN ? AND ?
+                        ORDER BY bucket_start
+                        """,
+                        (start_bucket, end_bucket),
+                    ):
+                        system_rows[int(row[0])] = row
+        except Exception as exc:
+            log(f"[!] Could not query statistics points: {exc}")
+
+    points = []
+    bucket = start_bucket
+    while bucket <= end_bucket:
+        node_row = node_rows.get(bucket)
+        system_row = system_rows.get(bucket)
+
+        sample_packets = int(node_row[1] or 0) if node_row else 0
+        sample_bytes = int(node_row[2] or 0) if node_row else 0
+        rejected_packets = int(node_row[3] or 0) if node_row else 0
+        rejected_bytes = int(node_row[4] or 0) if node_row else 0
+
+        point = {
+            "ts": bucket,
+            "sample_packets": sample_packets,
+            "sample_bytes": sample_bytes,
+            "rejected_packets": rejected_packets,
+            "rejected_bytes": rejected_bytes,
+            "throughput_bytes_per_sec": round(sample_bytes / max(1, bucket_step), 2),
+            "avg_signal": None,
+            "avg_abs_signal": None,
+            "avg_signal_stddev": None,
+            "avg_repeat_score": None,
+            "nodes": per_node_rows.get(bucket, {}),
+            "pool_bytes_avg": None,
+            "pool_fill_pct_avg": None,
+            "source_nodes_avg": None,
+            "rejecting_nodes_avg": None,
+            "waterfall_nodes_avg": None,
+        }
+
+        if node_row:
+            point["avg_signal"] = _safe_average(node_row[5] or 0.0, node_row[6] or 0.0)
+            point["avg_abs_signal"] = _safe_average(node_row[7] or 0.0, node_row[8] or 0.0)
+            point["avg_signal_stddev"] = _safe_average(node_row[9] or 0.0, node_row[10] or 0.0)
+            point["avg_repeat_score"] = _safe_average(node_row[11] or 0.0, node_row[12] or 0.0)
+
+        if system_row and system_row[6]:
+            count = float(system_row[6])
+            point["pool_bytes_avg"] = round(float(system_row[1] or 0.0) / count, 2)
+            point["pool_fill_pct_avg"] = round(float(system_row[2] or 0.0) / count, 4)
+            point["source_nodes_avg"] = round(float(system_row[3] or 0.0) / count, 2)
+            point["rejecting_nodes_avg"] = round(float(system_row[4] or 0.0) / count, 2)
+            point["waterfall_nodes_avg"] = round(float(system_row[5] or 0.0) / count, 2)
+
+        points.append(point)
+        bucket += bucket_step
+
+    return {
+        "bucket_seconds": bucket_step,
+        "range_seconds": range_seconds,
+        "generated_at": now,
+        "node": node_filter or "all",
+        "nodes": _query_metric_nodes(start_bucket),
+        "points": points,
+    }
+
+
+def _query_statistics_summary(range_seconds: int, node_filter: Optional[str]):
+    _flush_metrics_to_db()
+
+    now = time.time()
+    start_bucket = _metrics_bucket_start(now - range_seconds)
+    end_bucket = _metrics_bucket_start(now)
+    node_where = "bucket_start BETWEEN ? AND ?"
+    params = [start_bucket, end_bucket]
+    if node_filter:
+        node_where += " AND node = ?"
+        params.append(node_filter)
+
+    totals = {
+        "sample_packets": 0,
+        "sample_bytes": 0,
+        "rejected_packets": 0,
+        "rejected_bytes": 0,
+        "avg_signal": None,
+        "avg_abs_signal": None,
+        "avg_signal_stddev": None,
+        "avg_repeat_score": None,
+        "avg_throughput_bytes_per_sec": 0.0,
+    }
+    if _init_metrics_db():
+        try:
+            with metrics_db_lock:
+                with _connect_metrics_db() as conn:
+                    row = conn.execute(
+                        f"""
+                        SELECT
+                            SUM(sample_packets),
+                            SUM(sample_bytes),
+                            SUM(rejected_packets),
+                            SUM(rejected_bytes),
+                            SUM(signal_mean_sum),
+                            SUM(signal_mean_weight),
+                            SUM(signal_abs_mean_sum),
+                            SUM(signal_abs_mean_weight),
+                            SUM(signal_stddev_sum),
+                            SUM(signal_stddev_weight),
+                            SUM(audit_repeat_score_sum),
+                            SUM(audit_repeat_score_count)
+                        FROM node_metric_buckets
+                        WHERE {node_where}
+                        """,
+                        params,
+                    ).fetchone()
+            if row:
+                totals["sample_packets"] = int(row[0] or 0)
+                totals["sample_bytes"] = int(row[1] or 0)
+                totals["rejected_packets"] = int(row[2] or 0)
+                totals["rejected_bytes"] = int(row[3] or 0)
+                totals["avg_signal"] = _safe_average(row[4] or 0.0, row[5] or 0.0)
+                totals["avg_abs_signal"] = _safe_average(row[6] or 0.0, row[7] or 0.0)
+                totals["avg_signal_stddev"] = _safe_average(row[8] or 0.0, row[9] or 0.0)
+                totals["avg_repeat_score"] = _safe_average(row[10] or 0.0, row[11] or 0.0)
+                totals["avg_throughput_bytes_per_sec"] = round(
+                    totals["sample_bytes"] / max(1, range_seconds),
+                    2,
+                )
+        except Exception as exc:
+            log(f"[!] Could not query statistics summary: {exc}")
+
+    sources_snapshot = _snapshot_sources()
+    with pool_lock:
+        pool_bytes = len(entropy_pool)
+    with waterfalls_lock:
+        waterfall_nodes = len(waterfalls)
+    return {
+        "generated_at": now,
+        "range_seconds": range_seconds,
+        "node": node_filter or "all",
+        "metrics_enabled": _metrics_enabled(),
+        "metrics_bucket_seconds": METRICS_BUCKET_SEC,
+        "metrics_retention_days": METRICS_RETENTION_DAYS,
+        "current": {
+            "pool_bytes": pool_bytes,
+            "pool_fill_pct": round(_pool_fill_pct(), 2),
+            "source_nodes": len(sources_snapshot),
+            "rejecting_source_nodes": sum(
+                1 for source in sources_snapshot if not source.get("accepting_samples", True)
+            ),
+            "waterfall_nodes": waterfall_nodes,
+        },
+        "totals": totals,
+    }
+
+
+@app.route("/api/statistics/timeseries")
+def api_statistics_timeseries():
+    range_seconds = _parse_statistics_range_seconds(request.args.get("range"))
+    return jsonify(_query_statistics_points(range_seconds, _statistics_node_filter()))
+
+
+@app.route("/api/statistics/summary")
+def api_statistics_summary():
+    range_seconds = _parse_statistics_range_seconds(request.args.get("range"))
+    return jsonify(_query_statistics_summary(range_seconds, _statistics_node_filter()))
 
 
 @app.route("/waterfall")
@@ -1329,10 +2144,21 @@ def entropy_checkpoint_worker():
         _write_entropy_checkpoint()
 
 
+def metrics_flush_worker():
+    if not _metrics_enabled():
+        return
+
+    while True:
+        time.sleep(METRICS_FLUSH_INTERVAL_SEC)
+        _flush_metrics_to_db()
+
+
 def _start_background_threads():
     _load_entropy_checkpoint()
     if _entropy_persistence_enabled():
         atexit.register(_write_entropy_checkpoint)
+    if _metrics_enabled():
+        atexit.register(_flush_metrics_to_db)
 
     log(
         "[*] Entropy generator starting "
@@ -1347,7 +2173,10 @@ def _start_background_threads():
         f"entropy_persistence_enabled={_entropy_persistence_enabled()}, "
         f"entropy_persist_path={ENTROPY_PERSIST_PATH}, "
         f"entropy_persist_max_bytes={ENTROPY_PERSIST_MAX_BYTES}, "
-        f"entropy_persist_on_consume={ENTROPY_PERSIST_ON_CONSUME})"
+        f"entropy_persist_on_consume={ENTROPY_PERSIST_ON_CONSUME}, "
+        f"metrics_enabled={_metrics_enabled()}, "
+        f"metrics_db_path={METRICS_DB_PATH}, "
+        f"metrics_bucket_sec={METRICS_BUCKET_SEC})"
     )
     threading.Thread(target=udp_receiver_worker, daemon=True).start()
     threading.Thread(target=telnet_server_worker, daemon=True).start()
@@ -1355,6 +2184,7 @@ def _start_background_threads():
     threading.Thread(target=cleanup_incomplete_images_worker, daemon=True).start()
     threading.Thread(target=stats_logger_worker, daemon=True).start()
     threading.Thread(target=entropy_checkpoint_worker, daemon=True).start()
+    threading.Thread(target=metrics_flush_worker, daemon=True).start()
     log("[*] Entropy generator background threads online")
 
 
