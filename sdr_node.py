@@ -280,13 +280,13 @@ def effective_pluto_buffer_samples(attempt=1):
 def resolve_iio_uri():
     pluto_uri = PLUTO_IP.strip()
     if not pluto_uri or pluto_uri.lower() in ("local", "auto"):
+        if PLUTO_ALLOW_USB:
+            return "usb:"
         raise PlutoInitError(
             "PLUTO_IP=auto/local would trigger libiio auto-discovery. "
-            "Set PLUTO_IP=192.168.2.1 or PLUTO_ALLOW_USB=1 if you really need USB."
+            "Set PLUTO_IP=192.168.2.1 for IP-over-USB or PLUTO_IP=usb for USB."
         )
     if pluto_uri.lower() in ("usb", "usb:"):
-        if not PLUTO_ALLOW_USB:
-            raise PlutoInitError("USB backend disabled; set PLUTO_IP=192.168.2.1 or PLUTO_ALLOW_USB=1")
         return "usb:"
     if "://" in pluto_uri:
         return pluto_uri
