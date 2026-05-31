@@ -9,11 +9,17 @@ import sqlite3
 import string
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Dict, Optional
 
 from flask import Flask, Response, jsonify, request, stream_with_context
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
 
 UDP_HOST = os.getenv("UDP_HOST", "0.0.0.0")
 UDP_PORT = int(os.getenv("UDP_PORT", "5005"))
@@ -101,6 +107,15 @@ METRICS_FLUSH_INTERVAL_SEC = max(
 )
 METRICS_RETENTION_DAYS = max(1, int(os.getenv("METRICS_RETENTION_DAYS", "90")))
 METRICS_DEFAULT_RANGE_SEC = int(os.getenv("METRICS_DEFAULT_RANGE_SEC", str(24 * 60 * 60)))
+RANDOM_DEFAULT_LENGTH = max(1, int(os.getenv("RANDOM_DEFAULT_LENGTH", "32")))
+RANDOM_MAX_BYTES = max(RANDOM_DEFAULT_LENGTH, int(os.getenv("RANDOM_MAX_BYTES", "4096")))
+RAPIDAPI_ENABLED = _env_flag("RAPIDAPI_ENABLED", "1")
+RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "")
+RAPIDAPI_PROTECTED_PREFIXES = tuple(
+    prefix.strip()
+    for prefix in os.getenv("RAPIDAPI_PROTECTED_PREFIXES", "/v1/").split(",")
+    if prefix.strip()
+) or ("/v1/",)
 
 entropy_pool = bytearray()
 pool_lock = threading.Lock()
@@ -1487,17 +1502,13 @@ def _resolve_tcp_client_address(conn: socket.socket, fallback_address):
     return fallback_address
 
 
-app = Flask(__name__)
-app.wsgi_app = ProxyFix(
-    app.wsgi_app,
-    x_for=max(1, TRUSTED_PROXY_HOPS),
-    x_proto=1,
-    x_host=1,
-)
+def _rapidapi_secret_required_for_request() -> bool:
+    if not RAPIDAPI_ENABLED:
+        return False
+    return any(request.path.startswith(prefix) for prefix in RAPIDAPI_PROTECTED_PREFIXES)
 
 
-@app.route("/healthz")
-def healthz():
+def _build_health_payload():
     _cleanup_stale_nodes()
     sources_snapshot = _snapshot_sources()
     with pool_lock:
@@ -1508,36 +1519,332 @@ def healthz():
     rejecting_nodes = sum(
         1 for source in sources_snapshot if not source.get("accepting_samples", True)
     )
+    return {
+        "status": "ok",
+        "pool_bytes": pool_bytes,
+        "pool_fill_pct": round(_pool_fill_pct(), 2),
+        "pool_size_mb": POOL_SIZE_MB,
+        "raw_http_chunk": RAW_HTTP_CHUNK,
+        "telnet_session_bytes": _effective_telnet_session_bytes(),
+        "telnet_max_bytes_per_session": TELNET_MAX_BYTES_PER_SESSION,
+        "mix_block_bytes": MIX_BLOCK_BYTES,
+        "stream_chunk_bytes": STREAM_CHUNK_BYTES,
+        "low_pool_threshold_pct": LOW_POOL_THRESHOLD_PCT,
+        "throttle_bytes_per_sec": THROTTLE_BYTES_PER_SEC,
+        "telnet_port": TELNET_PORT,
+        "udp_port": UDP_PORT,
+        "nodes_with_waterfall": node_count,
+        "source_nodes": source_nodes,
+        "rejecting_source_nodes": rejecting_nodes,
+        "source_audit_repeat_score_threshold": SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD,
+        "source_audit_state_path": str(SOURCE_AUDIT_STATE_PATH),
+        "entropy_persistence_enabled": _entropy_persistence_enabled(),
+        "entropy_persist_path": str(ENTROPY_PERSIST_PATH)
+        if ENTROPY_PERSIST_PATH is not None
+        else None,
+        "entropy_persist_on_consume": ENTROPY_PERSIST_ON_CONSUME,
+        "entropy_rekey_restored_pool": ENTROPY_REKEY_RESTORED_POOL,
+        "last_entropy_checkpoint_at": last_entropy_checkpoint_at or None,
+        "metrics_enabled": _metrics_enabled(),
+        "metrics_bucket_seconds": METRICS_BUCKET_SEC,
+        "metrics_retention_days": METRICS_RETENTION_DAYS,
+        "random_default_length": RANDOM_DEFAULT_LENGTH,
+        "random_max_bytes": RANDOM_MAX_BYTES,
+        "rapidapi_enabled": RAPIDAPI_ENABLED,
+    }
+
+
+def _build_entropy_metrics_payload():
+    sources_snapshot = _snapshot_sources()
+    with pool_lock:
+        pool_bytes = len(entropy_pool)
+    with waterfalls_lock:
+        waterfall_nodes = len(waterfalls)
+    return {
+        "generated_at": time.time(),
+        "pool": {
+            "bytes": pool_bytes,
+            "max_bytes": POOL_MAX_BYTES,
+            "fill_pct": round(_pool_fill_pct(), 2),
+            "low_pool": _is_low_pool(),
+        },
+        "sources": {
+            "count": len(sources_snapshot),
+            "rejecting_count": sum(
+                1
+                for source in sources_snapshot
+                if not source.get("accepting_samples", True)
+            ),
+            "nodes": sources_snapshot,
+        },
+        "waterfalls": {
+            "nodes": waterfall_nodes,
+        },
+        "metrics": {
+            "enabled": _metrics_enabled(),
+            "bucket_seconds": METRICS_BUCKET_SEC,
+            "retention_days": METRICS_RETENTION_DAYS,
+        },
+    }
+
+
+def _parse_random_size_param(name: str, default_value: int):
+    raw_value = request.args.get(name)
+    if raw_value is None:
+        return default_value, None
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        parsed = 0
+    if parsed < 1 or parsed > RANDOM_MAX_BYTES:
+        return None, jsonify(
+            {
+                "error": "Invalid parameter",
+                "parameter": name,
+                "min": 1,
+                "max": RANDOM_MAX_BYTES,
+            }
+        )
+    return parsed, None
+
+
+def _consume_random_bytes(length: int):
+    data = _pop_entropy_chunk(length)
+    if data is None:
+        return None, jsonify({"error": "Warming up..."}), 503
+    return data, None, None
+
+
+def _base64url_no_padding(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _prometheus_label_value(value: object) -> str:
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def _prometheus_metrics_text() -> str:
+    metrics = _build_entropy_metrics_payload()
+    pool = metrics["pool"]
+    sources = metrics["sources"]["nodes"]
+    lines = [
+        "# HELP bbe_entropy_pool_bytes Current consumable entropy pool size.",
+        "# TYPE bbe_entropy_pool_bytes gauge",
+        f"bbe_entropy_pool_bytes {pool['bytes']}",
+        "# HELP bbe_entropy_pool_capacity_bytes Maximum entropy pool capacity.",
+        "# TYPE bbe_entropy_pool_capacity_bytes gauge",
+        f"bbe_entropy_pool_capacity_bytes {pool['max_bytes']}",
+        "# HELP bbe_entropy_pool_fill_percent Current pool fill percentage.",
+        "# TYPE bbe_entropy_pool_fill_percent gauge",
+        f"bbe_entropy_pool_fill_percent {pool['fill_pct']}",
+        "# HELP bbe_entropy_pool_low Whether the pool is below the low-pool threshold.",
+        "# TYPE bbe_entropy_pool_low gauge",
+        f"bbe_entropy_pool_low {1 if pool['low_pool'] else 0}",
+        "# HELP bbe_entropy_source_nodes Number of active entropy source nodes.",
+        "# TYPE bbe_entropy_source_nodes gauge",
+        f"bbe_entropy_source_nodes {metrics['sources']['count']}",
+        "# HELP bbe_entropy_rejecting_source_nodes Number of source nodes rejected by audit policy.",
+        "# TYPE bbe_entropy_rejecting_source_nodes gauge",
+        f"bbe_entropy_rejecting_source_nodes {metrics['sources']['rejecting_count']}",
+        "# HELP bbe_entropy_waterfall_nodes Number of nodes with waterfall frames.",
+        "# TYPE bbe_entropy_waterfall_nodes gauge",
+        f"bbe_entropy_waterfall_nodes {metrics['waterfalls']['nodes']}",
+        "# HELP bbe_entropy_metrics_enabled Whether SQLite metric aggregation is enabled.",
+        "# TYPE bbe_entropy_metrics_enabled gauge",
+        f"bbe_entropy_metrics_enabled {1 if metrics['metrics']['enabled'] else 0}",
+        "# HELP bbe_entropy_source_packets_total Accepted sample packets by source node.",
+        "# TYPE bbe_entropy_source_packets_total counter",
+    ]
+    for source in sources:
+        node = _prometheus_label_value(source["node"])
+        lines.append(
+            f'bbe_entropy_source_packets_total{{node="{node}"}} {source["packets"]}'
+        )
+    lines.extend(
+        [
+            "# HELP bbe_entropy_source_bytes_total Accepted sample bytes by source node.",
+            "# TYPE bbe_entropy_source_bytes_total counter",
+        ]
+    )
+    for source in sources:
+        node = _prometheus_label_value(source["node"])
+        lines.append(
+            f'bbe_entropy_source_bytes_total{{node="{node}"}} {source["raw_bytes"]}'
+        )
+    lines.extend(
+        [
+            "# HELP bbe_entropy_source_rejected_packets_total Rejected sample packets by source node.",
+            "# TYPE bbe_entropy_source_rejected_packets_total counter",
+        ]
+    )
+    for source in sources:
+        node = _prometheus_label_value(source["node"])
+        lines.append(
+            f'bbe_entropy_source_rejected_packets_total{{node="{node}"}} '
+            f'{source.get("rejected_packets", 0)}'
+        )
+    lines.extend(
+        [
+            "# HELP bbe_entropy_source_accepting_samples Whether a source node currently passes audit policy.",
+            "# TYPE bbe_entropy_source_accepting_samples gauge",
+        ]
+    )
+    for source in sources:
+        node = _prometheus_label_value(source["node"])
+        lines.append(
+            f'bbe_entropy_source_accepting_samples{{node="{node}"}} '
+            f'{1 if source.get("accepting_samples") else 0}'
+        )
+    lines.extend(
+        [
+            "# HELP bbe_entropy_source_last_seen_age_seconds Age of latest sample from source node.",
+            "# TYPE bbe_entropy_source_last_seen_age_seconds gauge",
+        ]
+    )
+    for source in sources:
+        if source.get("last_seen_age_sec") is None:
+            continue
+        node = _prometheus_label_value(source["node"])
+        lines.append(
+            f'bbe_entropy_source_last_seen_age_seconds{{node="{node}"}} '
+            f'{source["last_seen_age_sec"]}'
+        )
+    lines.extend(
+        [
+            "# HELP bbe_entropy_source_audit_repeat_score Latest source audit repeat score.",
+            "# TYPE bbe_entropy_source_audit_repeat_score gauge",
+        ]
+    )
+    for source in sources:
+        if source.get("source_audit_repeat_score") is None:
+            continue
+        node = _prometheus_label_value(source["node"])
+        lines.append(
+            f'bbe_entropy_source_audit_repeat_score{{node="{node}"}} '
+            f'{source["source_audit_repeat_score"]}'
+        )
+    return "\n".join(lines) + "\n"
+
+
+app = Flask(__name__)
+app.wsgi_app = ProxyFix(
+    app.wsgi_app,
+    x_for=max(1, TRUSTED_PROXY_HOPS),
+    x_proto=1,
+    x_host=1,
+)
+
+
+@app.before_request
+def require_rapidapi_proxy_secret():
+    if not _rapidapi_secret_required_for_request():
+        return None
+    if not RAPIDAPI_PROXY_SECRET:
+        return jsonify({"error": "RapidAPI proxy secret is not configured"}), 500
+
+    supplied_secret = request.headers.get("X-RapidAPI-Proxy-Secret", "")
+    if not hmac.compare_digest(supplied_secret, RAPIDAPI_PROXY_SECRET):
+        return jsonify({"error": "Forbidden"}), 403
+    return None
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify(_build_health_payload())
+
+
+@app.route("/health")
+def health():
+    return jsonify(_build_health_payload())
+
+
+@app.route("/v1/status")
+def v1_status():
+    return jsonify(_build_health_payload())
+
+
+@app.route("/v1/entropy/metrics")
+def v1_entropy_metrics():
+    return jsonify(_build_entropy_metrics_payload())
+
+
+@app.route("/metrics")
+def prometheus_metrics():
+    return Response(
+        _prometheus_metrics_text(),
+        content_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
+
+@app.route("/v1/random/bytes")
+def v1_random_bytes():
+    length, error_response = _parse_random_size_param("length", RANDOM_DEFAULT_LENGTH)
+    if error_response is not None:
+        return error_response, 400
+
+    data, error_response, status_code = _consume_random_bytes(length)
+    if error_response is not None:
+        return error_response, status_code
+    return Response(
+        data,
+        mimetype="application/octet-stream",
+        headers={"X-Entropy-Bytes": str(length)},
+    )
+
+
+@app.route("/v1/random/hex")
+def v1_random_hex():
+    length, error_response = _parse_random_size_param("length", RANDOM_DEFAULT_LENGTH)
+    if error_response is not None:
+        return error_response, 400
+
+    data, error_response, status_code = _consume_random_bytes(length)
+    if error_response is not None:
+        return error_response, status_code
+    return jsonify({"length": length, "encoding": "hex", "hex": data.hex()})
+
+
+@app.route("/v1/random/base64")
+def v1_random_base64():
+    length, error_response = _parse_random_size_param("length", RANDOM_DEFAULT_LENGTH)
+    if error_response is not None:
+        return error_response, 400
+
+    data, error_response, status_code = _consume_random_bytes(length)
+    if error_response is not None:
+        return error_response, status_code
     return jsonify(
         {
-            "status": "ok",
-            "pool_bytes": pool_bytes,
-            "pool_fill_pct": round(_pool_fill_pct(), 2),
-            "pool_size_mb": POOL_SIZE_MB,
-            "raw_http_chunk": RAW_HTTP_CHUNK,
-            "telnet_session_bytes": _effective_telnet_session_bytes(),
-            "telnet_max_bytes_per_session": TELNET_MAX_BYTES_PER_SESSION,
-            "mix_block_bytes": MIX_BLOCK_BYTES,
-            "stream_chunk_bytes": STREAM_CHUNK_BYTES,
-            "low_pool_threshold_pct": LOW_POOL_THRESHOLD_PCT,
-            "throttle_bytes_per_sec": THROTTLE_BYTES_PER_SEC,
-            "telnet_port": TELNET_PORT,
-            "udp_port": UDP_PORT,
-            "nodes_with_waterfall": node_count,
-            "source_nodes": source_nodes,
-            "rejecting_source_nodes": rejecting_nodes,
-            "source_audit_repeat_score_threshold": SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD,
-            "source_audit_state_path": str(SOURCE_AUDIT_STATE_PATH),
-            "entropy_persistence_enabled": _entropy_persistence_enabled(),
-            "entropy_persist_path": str(ENTROPY_PERSIST_PATH)
-            if ENTROPY_PERSIST_PATH is not None
-            else None,
-            "entropy_persist_on_consume": ENTROPY_PERSIST_ON_CONSUME,
-            "entropy_rekey_restored_pool": ENTROPY_REKEY_RESTORED_POOL,
-            "last_entropy_checkpoint_at": last_entropy_checkpoint_at or None,
-            "metrics_enabled": _metrics_enabled(),
-            "metrics_bucket_seconds": METRICS_BUCKET_SEC,
-            "metrics_retention_days": METRICS_RETENTION_DAYS,
+            "length": length,
+            "encoding": "base64",
+            "base64": base64.b64encode(data).decode("ascii"),
+        }
+    )
+
+
+@app.route("/v1/random/uuid")
+def v1_random_uuid():
+    data, error_response, status_code = _consume_random_bytes(16)
+    if error_response is not None:
+        return error_response, status_code
+    generated_uuid = uuid.UUID(bytes=data, version=4)
+    return jsonify({"uuid": str(generated_uuid), "version": 4})
+
+
+@app.route("/v1/random/secure-token")
+def v1_random_secure_token():
+    byte_count, error_response = _parse_random_size_param("bytes", RANDOM_DEFAULT_LENGTH)
+    if error_response is not None:
+        return error_response, 400
+
+    data, error_response, status_code = _consume_random_bytes(byte_count)
+    if error_response is not None:
+        return error_response, status_code
+    return jsonify(
+        {
+            "bytes": byte_count,
+            "encoding": "base64url",
+            "token": _base64url_no_padding(data),
         }
     )
 
