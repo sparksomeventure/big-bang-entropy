@@ -4,6 +4,7 @@ set -eu
 : "${AUDIT_CRON:=17 5 * * 6}"
 : "${TZ:=UTC}"
 : "${AUDIT_REPORTS_DIR:=/reports}"
+: "${AUDIT_PROFILE:=daily}"
 : "${AUDIT_RUN_ON_START:=0}"
 
 mkdir -p "$AUDIT_REPORTS_DIR"
@@ -14,6 +15,7 @@ cat > /app/run_audit_once.sh <<EOF
 set -eu
 export TZ=$(printf '%s' "$TZ")
 export AUDIT_REPORTS_DIR=$(printf '%s' "$AUDIT_REPORTS_DIR")
+export AUDIT_PROFILE=$(printf '%s' "${AUDIT_PROFILE:-daily}")
 export AUDIT_TARGET_HOST=$(printf '%s' "${AUDIT_TARGET_HOST:-generator}")
 export AUDIT_TARGET_TCP_PORT=$(printf '%s' "${AUDIT_TARGET_TCP_PORT:-1420}")
 export AUDIT_TARGET_PREMIX_PORT=$(printf '%s' "${AUDIT_TARGET_PREMIX_PORT:-1421}")
@@ -21,7 +23,7 @@ export AUDIT_TARGET_HTTP_URL=$(printf '%s' "${AUDIT_TARGET_HTTP_URL:-http://gene
 export AUDIT_SAMPLE_SIZE=$(printf '%s' "${AUDIT_SAMPLE_SIZE:-20971520}")
 export AUDIT_PREMIX_SIZE=$(printf '%s' "${AUDIT_PREMIX_SIZE:-8388608}")
 export AUDIT_RNGTEST_BLOCKS=$(printf '%s' "${AUDIT_RNGTEST_BLOCKS:-1000}")
-export AUDIT_DIEHARDER_TESTS=$(printf '%s' "${AUDIT_DIEHARDER_TESTS:-0,1,2,8,15,100}")
+export AUDIT_DIEHARDER_TESTS=$(printf '%s' "${AUDIT_DIEHARDER_TESTS:-0,1,8,15,100}")
 export AUDIT_SHA512_ROUNDS=$(printf '%s' "${AUDIT_SHA512_ROUNDS:-32}")
 export AUDIT_SOCKET_TIMEOUT_SEC=$(printf '%s' "${AUDIT_SOCKET_TIMEOUT_SEC:-5}")
 export AUDIT_FETCH_MAX_SEC=$(printf '%s' "${AUDIT_FETCH_MAX_SEC:-300}")
@@ -49,4 +51,5 @@ if [ "$AUDIT_RUN_ON_START" = "1" ]; then
 fi
 
 touch /var/log/entropy-audit.log
+echo "[*] audit container online (profile=${AUDIT_PROFILE:-daily}, cron=$AUDIT_CRON, reports_dir=$AUDIT_REPORTS_DIR)"
 exec cron -f

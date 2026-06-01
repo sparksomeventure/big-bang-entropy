@@ -774,6 +774,29 @@ def _store_entropy(payload: bytes):
     _request_entropy_checkpoint()
 
 
+NODE_METADATA_KEYS = (
+    "node_name",
+    "host_id",
+    "receiver_id",
+    "device_id",
+    "sdr_type",
+    "freq_hz",
+    "rx_channel",
+    "rtl_sdr_index",
+    "pluto_ip",
+)
+
+
+def _node_metadata_from_message(message: dict) -> Dict[str, object]:
+    metadata: Dict[str, object] = {}
+    for key in NODE_METADATA_KEYS:
+        value = message.get(key)
+        if value is None or value == "":
+            continue
+        metadata[key] = value
+    return metadata
+
+
 def _persist_source_audits():
     try:
         SOURCE_AUDIT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -965,7 +988,13 @@ def _effective_telnet_session_bytes() -> int:
     return min(max(1, TELNET_SESSION_BYTES), TELNET_MAX_BYTES_PER_SESSION)
 
 
-def _store_waterfall(node_name: str, frame_id: str, image_format: str, image_bytes: bytes):
+def _store_waterfall(
+    node_name: str,
+    frame_id: str,
+    image_format: str,
+    image_bytes: bytes,
+    metadata: Optional[Dict[str, object]] = None,
+):
     if image_format not in ("png", "webp"):
         return
 
@@ -975,8 +1004,11 @@ def _store_waterfall(node_name: str, frame_id: str, image_format: str, image_byt
             {
                 "frames": [],
                 "updated_at": 0.0,
+                "metadata": {},
             },
         )
+        if metadata:
+            state["metadata"] = dict(metadata)
 
         frame = next(
             (item for item in state["frames"] if item["frame_id"] == frame_id),
@@ -1100,32 +1132,42 @@ def _snapshot_sources():
         audit_snapshot = {
             node_name: dict(state) for node_name, state in source_audits.items()
         }
+    with node_runtime_stats_lock:
+        runtime_snapshot = {
+            node_name: dict(state) for node_name, state in node_runtime_stats.items()
+        }
     with node_stats_lock:
         payload = []
         for node_name, state in sorted(node_stats.items()):
             active_for = max(now - state["first_seen"], 1.0)
             audit_info = audit_snapshot.get(node_name)
             audit_summary = _source_audit_summary(audit_info, now=now)
-            payload.append(
-                {
-                    "node": node_name,
-                    "raw_bytes": state["raw_bytes"],
-                    "payload_bytes": state["payload_bytes"],
-                    "packets": state["packets"],
-                    "rejected_packets": state.get("rejected_packets", 0),
-                    "rejected_bytes": state.get("rejected_bytes", 0),
-                    "first_seen": state["first_seen"],
-                    "last_seen": state["last_seen"],
-                    "last_seen_age_sec": round(now - state["last_seen"], 1)
-                    if state["last_seen"]
-                    else None,
-                    "avg_bytes_per_sec": round(state["raw_bytes"] / active_for, 1),
-                    "source_audit_status": audit_summary["status"],
-                    "source_audit_repeat_score": audit_summary["repeat_score"],
-                    "source_audit_age_sec": audit_summary["age_sec"],
-                    "accepting_samples": audit_summary["accepting_samples"],
-                }
-            )
+            metadata = dict((runtime_snapshot.get(node_name) or {}).get("metadata") or {})
+            if audit_info:
+                for key in NODE_METADATA_KEYS:
+                    if key in audit_info and key not in metadata:
+                        metadata[key] = audit_info[key]
+            item = {
+                "node": node_name,
+                "metadata": metadata,
+                "raw_bytes": state["raw_bytes"],
+                "payload_bytes": state["payload_bytes"],
+                "packets": state["packets"],
+                "rejected_packets": state.get("rejected_packets", 0),
+                "rejected_bytes": state.get("rejected_bytes", 0),
+                "first_seen": state["first_seen"],
+                "last_seen": state["last_seen"],
+                "last_seen_age_sec": round(now - state["last_seen"], 1)
+                if state["last_seen"]
+                else None,
+                "avg_bytes_per_sec": round(state["raw_bytes"] / active_for, 1),
+                "source_audit_status": audit_summary["status"],
+                "source_audit_repeat_score": audit_summary["repeat_score"],
+                "source_audit_age_sec": audit_summary["age_sec"],
+                "accepting_samples": audit_summary["accepting_samples"],
+            }
+            item.update(metadata)
+            payload.append(item)
     return payload
 
 
@@ -1236,7 +1278,13 @@ def _handle_waterfall_part(message: dict):
             del image_fragments[message_id]
 
     if completed_image is not None and completed_format and completed_frame_id:
-        _store_waterfall(node_name, completed_frame_id, completed_format, completed_image)
+        _store_waterfall(
+            node_name,
+            completed_frame_id,
+            completed_format,
+            completed_image,
+            _node_metadata_from_message(message),
+        )
 
 
 def _handle_source_audit(message: dict):
@@ -1261,6 +1309,7 @@ def _handle_source_audit(message: dict):
         "min_value": int(metrics.get("min_value", 0) or 0),
         "max_value": int(metrics.get("max_value", 0) or 0),
     }
+    audit_payload.update(_node_metadata_from_message(message))
     summary = _source_audit_summary(audit_payload, now=updated_at)
     audit_payload["status"] = summary["status"]
     audit_payload["accepting_samples"] = summary["accepting_samples"]
@@ -1299,6 +1348,7 @@ def _handle_node_metrics(message: dict):
 
     stats = message.get("stats") if isinstance(message.get("stats"), dict) else {}
     signal = message.get("signal") if isinstance(message.get("signal"), dict) else {}
+    metadata = _node_metadata_from_message(message)
     timestamp = _optional_float(message.get("timestamp")) or time.time()
     _touch_node_stats(node_name)
 
@@ -1318,6 +1368,7 @@ def _handle_node_metrics(message: dict):
                 "health_rejected_packets": _optional_int(stats.get("health_rejected_packets")) or 0,
                 "rct_rejected_packets": _optional_int(stats.get("rct_rejected_packets")) or 0,
                 "apt_rejected_packets": _optional_int(stats.get("apt_rejected_packets")) or 0,
+                "metadata": metadata,
             }
         )
 
@@ -1886,6 +1937,7 @@ def list_waterfalls():
         payload = [
             {
                 "node": node_name,
+                "metadata": dict(state.get("metadata") or {}),
                 "updated_at": state["updated_at"],
                 "frame_count": len(state["frames"]),
                 "frames": [
@@ -1918,9 +1970,17 @@ def get_node_status(node_name: str):
         stats = node_stats.get(node_name, {})
         last_seen = stats.get("last_seen", 0.0)
         rejected_packets = stats.get("rejected_packets", 0)
+    with node_runtime_stats_lock:
+        runtime = node_runtime_stats.get(node_name, {})
+        metadata = dict(runtime.get("metadata") or {})
+    if audit_info:
+        for key in NODE_METADATA_KEYS:
+            if key in audit_info and key not in metadata:
+                metadata[key] = audit_info[key]
 
     return jsonify({
         "node": node_name,
+        "metadata": metadata,
         "status": summary["status"],
         "accepting_samples": summary["accepting_samples"],
         "repeat_score": summary["repeat_score"],

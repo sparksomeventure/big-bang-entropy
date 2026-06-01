@@ -117,7 +117,28 @@ Additional deployment details such as `indoor/outdoor`, OS, or image version sho
 The most important settings for a node deployment are:
 
 - `NODE_NAME` - logical name of the SDR node, for example `pl-lub-sdr-ad9363-omni01`
+- `RECEIVER_ID` - optional ID of one physical receiver/RF chain on the same host
+- `PHYSICAL_HOST_ID` - optional physical host ID used to group several receivers on one box
+- `NODE_ID` - optional compatibility override; when empty, the stream ID is `NODE_NAME`
 - `UDP_TARGET_HOST` - hostname or IP address of the central generator
+
+For multiple receivers on one physical host, run one container per receiver with a unique
+`NODE_NAME`, the same `PHYSICAL_HOST_ID`, and a different `RECEIVER_ID` plus the right
+hardware selector, such as `RTL_SDR_INDEX`, `PLUTO_IP`, or `RX_CHANNEL`. The generator uses
+`NODE_NAME` as the unique key by default, while host and receiver details stay available as
+metadata.
+
+Keep `NODE_NAME` in the `country-location-technology-radio-antennaNumber` convention, for
+example `pl-lub-sdr-ad9363-omni01`, `pl-lub-sdr-rtlsdr-loop01`, or
+`de-ber-sdr-hackrf-omni03`. Frequency bands belong in `FREQ`, not in the node name.
+
+`RECEIVER_ID` is a human-assigned stable label, not necessarily a hardware serial. To see
+what the node will use, run:
+
+```bash
+docker compose run --rm sdr-node-1 python3 sdr_node.py --print-identity
+docker compose run --rm sdr-node-1 python3 sdr_node.py --list-devices
+```
 
 For a multi-host setup, the SDR node does not need a local generator container. It can send UDP packets to any reachable generator instance.
 
@@ -346,20 +367,23 @@ Reports are written to the shared `/reports/` directory and can be published dir
 - `SHA-256` checksum files
 - an integrity-chain record
 
-By default the audit stack runs a small set of representative `Dieharder` tests instead of a
-single subtest. `PractRand` is supported as an optional heavier stage and can be enabled with
-`AUDIT_PRACTRAND=1`.
+By default the daily audit stack runs a light set of representative `Dieharder` tests
+(`0,1,8,15,100`) instead of a single subtest. It intentionally skips `rank_32x32`
+(`-d 2`) because a 20 MiB daily sample can make Dieharder rewind the input file and
+produce low-confidence results. `PractRand` is supported as an optional heavier stage and
+can be enabled with `AUDIT_PRACTRAND=1`.
 
-For a slower nightly audit profile, a practical example is:
+The compose stack also defines `audit-weekly`, which writes to the same `/reports` volume
+and is intended for a deeper weekly run:
 
 ```env
-AUDIT_CRON=17 2 * * *
-AUDIT_SAMPLE_SIZE=67108864
-AUDIT_PREMIX_SIZE=33554432
-AUDIT_DIEHARDER_TESTS=0,1,2,8,15,100
-AUDIT_PRACTRAND=1
-AUDIT_PRACTRAND_TLMAX=1G
-AUDIT_PRACTRAND_MAX_BYTES=268435456
+AUDIT_WEEKLY_CRON=23 3 * * 0
+AUDIT_WEEKLY_SAMPLE_SIZE=335544320
+AUDIT_WEEKLY_PREMIX_SIZE=67108864
+AUDIT_WEEKLY_DIEHARDER_TESTS=0,1,2,8,15,100
+AUDIT_WEEKLY_PRACTRAND=1
+AUDIT_WEEKLY_PRACTRAND_TLMAX=1G
+AUDIT_WEEKLY_PRACTRAND_MAX_BYTES=268435456
 ```
 
 If `RNG_test` is not installed in the audit image, the audit report will add an alert instead of

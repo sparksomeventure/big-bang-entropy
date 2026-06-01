@@ -40,7 +40,14 @@ PLUTO_INIT_BACKOFF_BASE_SEC = float(os.getenv("PLUTO_INIT_BACKOFF_BASE_SEC", "5"
 PLUTO_INIT_BACKOFF_MAX_SEC = float(os.getenv("PLUTO_INIT_BACKOFF_MAX_SEC", "45"))
 PLUTO_FAILURE_COOLDOWN_SEC = float(os.getenv("PLUTO_FAILURE_COOLDOWN_SEC", "90"))
 PLUTO_SOCKET_TIMEOUT_SEC = float(os.getenv("PLUTO_SOCKET_TIMEOUT_SEC", "3"))
-NODE_NAME = os.getenv("NODE_NAME", socket.gethostname())
+NODE_NAME = os.getenv("NODE_NAME", socket.gethostname()).strip() or socket.gethostname()
+RECEIVER_ID = os.getenv("RECEIVER_ID", os.getenv("SDR_RECEIVER_ID", "")).strip()
+NODE_ID = os.getenv("NODE_ID", "").strip() or NODE_NAME
+PHYSICAL_HOST_ID = (
+    os.getenv("PHYSICAL_HOST_ID", os.getenv("SDR_HOST_ID", socket.gethostname())).strip()
+    or socket.gethostname()
+)
+SDR_DEVICE_ID = os.getenv("SDR_DEVICE_ID", "").strip()
 UDP_TARGET_HOST = os.getenv("UDP_TARGET_HOST", "generator")
 UDP_TARGET_PORT = int(os.getenv("UDP_TARGET_PORT", "5005"))
 SAMPLE_PACKET_BYTES = int(os.getenv("SAMPLE_PACKET_BYTES", "12000"))
@@ -101,6 +108,26 @@ axis_window_frames = max(2, int(math.ceil(max(1, WATERFALL_AXIS_WINDOW_SEC) / ma
 waterfall_axis_metrics = deque(maxlen=axis_window_frames)
 MAX_SHARED_RAW_IQ_AGE_SEC = max(10, WATERFALL_INTERVAL_SEC * 3)
 MAX_SAFE_SAMPLE_PACKET_BYTES = 48000
+
+
+def node_identity_payload():
+    payload = {
+        "node": NODE_ID,
+        "node_name": NODE_NAME,
+        "host_id": PHYSICAL_HOST_ID,
+        "sdr_type": SDR_TYPE,
+        "freq_hz": FREQ,
+        "rx_channel": RX_CHANNEL,
+    }
+    if RECEIVER_ID:
+        payload["receiver_id"] = RECEIVER_ID
+    if SDR_DEVICE_ID:
+        payload["device_id"] = SDR_DEVICE_ID
+    if SDR_TYPE == "rtlsdr":
+        payload["rtl_sdr_index"] = RTL_SDR_INDEX
+    if SDR_TYPE == "pluto":
+        payload["pluto_ip"] = PLUTO_IP
+    return payload
 
 
 def getenv_optional_float(name: str):
@@ -382,6 +409,17 @@ class CompatRtlSdr:
             return cls._library
 
         lib = ctypes.CDLL("librtlsdr.so")
+        lib.rtlsdr_get_device_count.argtypes = []
+        lib.rtlsdr_get_device_count.restype = ctypes.c_uint32
+        lib.rtlsdr_get_device_name.argtypes = [ctypes.c_uint32]
+        lib.rtlsdr_get_device_name.restype = ctypes.c_char_p
+        lib.rtlsdr_get_device_usb_strings.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+        ]
+        lib.rtlsdr_get_device_usb_strings.restype = ctypes.c_int
         lib.rtlsdr_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32]
         lib.rtlsdr_open.restype = ctypes.c_int
         lib.rtlsdr_close.argtypes = [ctypes.c_void_p]
@@ -405,6 +443,28 @@ class CompatRtlSdr:
         lib.rtlsdr_read_sync.restype = ctypes.c_int
         cls._library = lib
         return lib
+
+    @classmethod
+    def list_devices(cls):
+        lib = cls._get_library()
+        count = int(lib.rtlsdr_get_device_count())
+        devices = []
+        for index in range(count):
+            name_raw = lib.rtlsdr_get_device_name(index)
+            manufacturer = ctypes.create_string_buffer(256)
+            product = ctypes.create_string_buffer(256)
+            serial = ctypes.create_string_buffer(256)
+            result = lib.rtlsdr_get_device_usb_strings(index, manufacturer, product, serial)
+            devices.append(
+                {
+                    "index": index,
+                    "name": name_raw.decode("utf-8", errors="replace") if name_raw else "",
+                    "manufacturer": manufacturer.value.decode("utf-8", errors="replace") if result == 0 else "",
+                    "product": product.value.decode("utf-8", errors="replace") if result == 0 else "",
+                    "serial": serial.value.decode("utf-8", errors="replace") if result == 0 else "",
+                }
+            )
+        return devices
 
     def _require_ok(self, result, operation):
         if result != 0:
@@ -840,7 +900,7 @@ def entropy_sender_worker(source):
     chunk_target = effective_sample_packet_bytes()
 
     log(
-        f"[*] Entropy sender worker active (node={NODE_NAME}, type={SDR_TYPE}, "
+        f"[*] Entropy sender worker active (node={NODE_ID}, type={SDR_TYPE}, "
         f"sample_packet_bytes={chunk_target}, decimation={ENTROPY_DECIMATION_FACTOR})"
     )
 
@@ -935,7 +995,7 @@ def entropy_sender_worker(source):
                     sock,
                     {
                         "type": "samples",
-                        "node": NODE_NAME,
+                        **node_identity_payload(),
                         "payload_b64": base64.b64encode(chunk).decode("ascii"),
                         "raw_bytes": len(chunk),
                         "timestamp": time.time(),
@@ -1019,7 +1079,7 @@ def render_lightweight_waterfall_png(
         draw_trace(history, (8, fade, fade + 20), glow=False)
     draw_trace(current_power, (103, 232, 249), glow=True)
 
-    title = f"{NODE_NAME}  {DISPLAY_FREQ_HZ / 1e6:.3f} MHz"
+    title = f"{NODE_ID}  {DISPLAY_FREQ_HZ / 1e6:.3f} MHz"
     draw_ascii_label(image, title[:80], 24, 14, (103, 232, 249))
     draw_ascii_label(image, "DUMMY SDR WATERFALL", 24, height - 24, (34, 211, 238))
     return encode_rgb_png(image)
@@ -1082,7 +1142,7 @@ def waterfall_sender_worker():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     log(
-        f"[*] Waterfall worker ready (node={NODE_NAME}, interval={WATERFALL_INTERVAL_SEC}s, "
+        f"[*] Waterfall worker ready (node={NODE_ID}, interval={WATERFALL_INTERVAL_SEC}s, "
         f"udp_chunk_bytes={WATERFALL_UDP_CHUNK_BYTES}, source=shared_raw_iq)"
     )
 
@@ -1187,7 +1247,7 @@ def waterfall_sender_worker():
                 ax.scatter(x[::64], y[::64], s=6, c=THEME_ACCENT, alpha=0.35, linewidths=0, zorder=5)
 
                 ax.set_title(
-                    f"Node {NODE_NAME} - Cosmic Noise @ {DISPLAY_FREQ_HZ / axis_scale_hz:.3f} {axis_unit}",
+                    f"Node {NODE_ID} - Cosmic Noise @ {DISPLAY_FREQ_HZ / axis_scale_hz:.3f} {axis_unit}",
                     color=THEME_PRIMARY,
                     fontsize=12,
                     pad=12,
@@ -1236,7 +1296,7 @@ def waterfall_sender_worker():
                         sock,
                         {
                             "type": "waterfall",
-                            "node": NODE_NAME,
+                            **node_identity_payload(),
                             "frame_id": frame_id,
                             "format": image_format,
                             "message_id": message_id,
@@ -1253,7 +1313,7 @@ def waterfall_sender_worker():
                 runtime_stats["waterfalls_sent"] += 1
                 runtime_stats["last_waterfall_at"] = time.time()
             log(
-                f"[*] Waterfall sent (node={NODE_NAME}, frame_id={frame_id}, "
+                f"[*] Waterfall sent (node={NODE_ID}, frame_id={frame_id}, "
                 f"history={len(history_frames)}, {', '.join(part_count_summary)})"
             )
             time.sleep(WATERFALL_INTERVAL_SEC)
@@ -1265,7 +1325,7 @@ def waterfall_sender_worker():
 def source_audit_worker():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     log(
-        f"[*] Source audit worker ready (node={NODE_NAME}, interval={SOURCE_AUDIT_INTERVAL_SEC}s, "
+        f"[*] Source audit worker ready (node={NODE_ID}, interval={SOURCE_AUDIT_INTERVAL_SEC}s, "
         f"sample_bytes~={SOURCE_AUDIT_SAMPLE_BYTES}, source=shared_raw_iq)"
     )
 
@@ -1295,7 +1355,7 @@ def source_audit_worker():
                 sock,
                 {
                     "type": "source_audit",
-                    "node": NODE_NAME,
+                    **node_identity_payload(),
                     "timestamp": raw_iq_at or time.time(),
                     "metrics": metrics,
                 },
@@ -1305,7 +1365,7 @@ def source_audit_worker():
                 runtime_stats["last_source_audit_at"] = time.time()
             first_run = False
             log(
-                f"[*] Source audit sent (node={NODE_NAME}, repeat_score={metrics['repeat_score']}, "
+                f"[*] Source audit sent (node={NODE_ID}, repeat_score={metrics['repeat_score']}, "
                 f"spectral_flatness={metrics['spectral_flatness']})"
             )
         except Exception as exc:
@@ -1316,7 +1376,7 @@ def source_audit_worker():
 def node_metrics_worker():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     log(
-        f"[*] Node metrics worker ready (node={NODE_NAME}, interval={NODE_METRICS_INTERVAL_SEC}s)"
+        f"[*] Node metrics worker ready (node={NODE_ID}, interval={NODE_METRICS_INTERVAL_SEC}s)"
     )
 
     while True:
@@ -1327,7 +1387,7 @@ def node_metrics_worker():
             signal = get_latest_signal_metrics()
             message = {
                 "type": "node_metrics",
-                "node": NODE_NAME,
+                **node_identity_payload(),
                 "timestamp": time.time(),
                 "stats": snapshot,
             }
@@ -1340,7 +1400,7 @@ def node_metrics_worker():
 
 
 def status_poller_worker():
-    safe_node_name = urllib.parse.quote(NODE_NAME)
+    safe_node_name = urllib.parse.quote(NODE_ID)
     
     # Construct URL. If port is empty, don't append it.
     if HTTP_TARGET_PORT:
@@ -1409,7 +1469,7 @@ def stats_logger_worker():
         )
         log(
             "[*] SDR node stats: "
-            f"node={NODE_NAME}, "
+            f"node={NODE_ID}, "
             f"sample_packets_sent={snapshot['sample_packets_sent']}, "
             f"sample_bytes_sent={snapshot['sample_bytes_sent']}, "
             f"health_rejected_packets={snapshot['health_rejected_packets']}, "
@@ -1462,10 +1522,93 @@ def diagnose_pluto():
         cleanup_sdr_source(source)
 
 
+def print_node_identity():
+    identity = node_identity_payload()
+    log("[*] Effective SDR node identity:")
+    for key in sorted(identity):
+        log(f"    {key}={identity[key]}")
+    log(
+        "[*] Frequency plan: "
+        f"rf={RADIO_FREQ_PLAN['rf_freq_hz']} Hz, "
+        f"tuner={RADIO_FREQ_PLAN['tuner_freq_hz']} Hz, "
+        f"mode={RADIO_FREQ_PLAN['mode']}"
+    )
+
+
+def example_node_name(radio: str, antenna: str, index: int) -> str:
+    return f"pl-lub-sdr-{radio}-{antenna}{max(1, index):02d}"
+
+
+def list_sdr_devices():
+    print_node_identity()
+    log(
+        "[*] NODE_NAME examples use country-location-technology-radio-antennaNumber; "
+        "replace pl-lub and antenna labels for your site."
+    )
+    if SDR_TYPE == "rtlsdr":
+        try:
+            devices = CompatRtlSdr.list_devices()
+        except Exception as exc:
+            log(f"[!] Could not list RTL-SDR devices: {exc}")
+            return 1
+        if not devices:
+            log("[!] No RTL-SDR devices found.")
+            return 1
+        log("[*] RTL-SDR devices:")
+        for item in devices:
+            serial = item.get("serial") or "-"
+            label = item.get("product") or item.get("name") or "RTL-SDR"
+            suggested_receiver = f"rtlsdr-omni{item['index'] + 1:02d}"
+            suggested_node = example_node_name("rtlsdr", "omni", item["index"] + 1)
+            suggested_device = serial if serial != "-" else f"rtlsdr-index-{item['index']}"
+            log(
+                f"    index={item['index']} serial={serial} "
+                f"name={item.get('name') or '-'} product={label}"
+            )
+            log(
+                "    example env: "
+                f"NODE_NAME={suggested_node} RECEIVER_ID={suggested_receiver} "
+                f"RTL_SDR_INDEX={item['index']} SDR_DEVICE_ID={suggested_device}"
+            )
+        return 0
+
+    if SDR_TYPE == "pluto":
+        uri = resolve_iio_uri()
+        log(f"[*] Pluto/libiio target URI: {uri}")
+        try:
+            ctx = iio.Context(uri)
+        except Exception as exc:
+            log(f"[!] Could not create IIO context for {uri}: {format_iio_error(exc)}")
+            return 1
+        log(f"[*] IIO context: {ctx.name}")
+        log("[*] IIO devices:")
+        for dev in ctx.devices:
+            log(f"    id={dev.id} name={dev.name or '-'}")
+        suggested_receiver = "ad9363-omni01"
+        suggested_node = example_node_name("ad9363", "omni", 1)
+        log(
+            "    example env: "
+            f"NODE_NAME={suggested_node} RECEIVER_ID={suggested_receiver} "
+            f"PLUTO_IP={PLUTO_IP} SDR_DEVICE_ID={uri}"
+        )
+        return 0
+
+    if SDR_TYPE == "dummy":
+        log(
+            "[*] Dummy SDR has no physical device. Example: "
+            "NODE_NAME=pl-lub-dummy-test-omni01 RECEIVER_ID=dummy-omni01"
+        )
+        return 0
+
+    log(f"[!] Device listing is not implemented for SDR_TYPE={SDR_TYPE}")
+    return 1
+
+
 def run_sdr_node():
     log(
-        f"[*] SDR node {NODE_NAME} starting. Target: "
-        f"{UDP_TARGET_HOST}:{UDP_TARGET_PORT}, Source type: {SDR_TYPE}"
+        f"[*] SDR node {NODE_ID} starting. Target: "
+        f"{UDP_TARGET_HOST}:{UDP_TARGET_PORT}, Source type: {SDR_TYPE}, "
+        f"node_name={NODE_NAME}, receiver_id={RECEIVER_ID or '-'}, host_id={PHYSICAL_HOST_ID}"
     )
     log(
         f"[*] Frequency plan: mode={RADIO_FREQ_PLAN['mode']}, "
@@ -1522,6 +1665,16 @@ def run_sdr_node():
 def parse_args():
     parser = argparse.ArgumentParser(description="Big Bang Entropy SDR node")
     parser.add_argument(
+        "--print-identity",
+        action="store_true",
+        help="print effective node identity, receiver metadata, and frequency plan without opening hardware",
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="list detectable SDR devices for the selected SDR_TYPE and print example env values",
+    )
+    parser.add_argument(
         "--diagnose-pluto",
         action="store_true",
         help="run a one-shot PlutoSDR IIO connectivity and small-buffer read test without UDP",
@@ -1531,6 +1684,11 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.print_identity:
+        print_node_identity()
+        raise SystemExit(0)
+    if args.list_devices:
+        raise SystemExit(list_sdr_devices())
     if args.diagnose_pluto:
         raise SystemExit(diagnose_pluto())
     run_sdr_node()

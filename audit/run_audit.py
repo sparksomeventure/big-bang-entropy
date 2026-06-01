@@ -9,11 +9,12 @@ TARGET_HOST       = os.getenv("AUDIT_TARGET_HOST", "generator")
 TARGET_TCP_PORT   = int(os.getenv("AUDIT_TARGET_TCP_PORT", "1420"))
 TARGET_PREMIX_PORT = int(os.getenv("AUDIT_TARGET_PREMIX_PORT", "1421"))
 TARGET_HTTP_URL   = os.getenv("AUDIT_TARGET_HTTP_URL", "http://generator:8080")
+AUDIT_PROFILE     = os.getenv("AUDIT_PROFILE", "daily").strip() or "daily"
 SAMPLE_SIZE       = int(os.getenv("AUDIT_SAMPLE_SIZE", str(20 * 1024 * 1024)))
 PREMIX_SIZE       = int(os.getenv("AUDIT_PREMIX_SIZE", str(8 * 1024 * 1024)))
 RNGTEST_BLOCKS    = int(os.getenv("AUDIT_RNGTEST_BLOCKS", "1000"))
 CHAIN_SECRET      = os.getenv("AUDIT_CHAIN_SECRET", "")
-DIEHARDER_TESTS   = [x.strip() for x in os.getenv("AUDIT_DIEHARDER_TESTS", "0,1,2,8,15,100").split(",") if x.strip()]
+DIEHARDER_TESTS   = [x.strip() for x in os.getenv("AUDIT_DIEHARDER_TESTS", "0,1,8,15,100").split(",") if x.strip()]
 SHA512_ROUNDS     = int(os.getenv("AUDIT_SHA512_ROUNDS", "32"))
 SOCKET_TIMEOUT    = float(os.getenv("AUDIT_SOCKET_TIMEOUT_SEC", "5"))
 FETCH_MAX_SEC     = float(os.getenv("AUDIT_FETCH_MAX_SEC", "300"))
@@ -118,6 +119,55 @@ def parse_rngtest(out, err):
 def summarize_dieharder(stdout):
     return [l.strip() for l in stdout.splitlines() if any(m in l for m in ("PASSED","FAILED","WEAK"))]
 
+def detect_dieharder_rewind(stdout, stderr=""):
+    text = f"{stdout}\n{stderr}".lower()
+    return "rewound" in text or "file_input_raw" in text and "rewind" in text
+
+def analyze_dieharder_runs(runs):
+    lines = []
+    rewound_tests = []
+    failed_tests = []
+    weak_tests = []
+    failed_rewound_tests = []
+    failed_non_rewound_tests = []
+
+    for item in runs:
+        test_id = str(item.get("test_id", "?"))
+        result_lines = item.get("interesting_lines")
+        if not isinstance(result_lines, list):
+            result_lines = summarize_dieharder(str(item.get("stdout", "")))
+        item["interesting_lines"] = result_lines
+
+        rewound = bool(item.get("rewound")) or detect_dieharder_rewind(
+            str(item.get("stdout", "")),
+            str(item.get("stderr", "")),
+        )
+        item["rewound"] = rewound
+        lines.extend(result_lines)
+
+        failed = any("FAILED" in line for line in result_lines)
+        weak = any("WEAK" in line for line in result_lines)
+        if rewound:
+            rewound_tests.append(test_id)
+        if failed:
+            failed_tests.append(test_id)
+            if rewound:
+                failed_rewound_tests.append(test_id)
+            else:
+                failed_non_rewound_tests.append(test_id)
+        if weak:
+            weak_tests.append(test_id)
+
+    return {
+        "interesting_lines": lines,
+        "rewound_tests": rewound_tests,
+        "failed_tests": failed_tests,
+        "weak_tests": weak_tests,
+        "failed_rewound_tests": failed_rewound_tests,
+        "failed_non_rewound_tests": failed_non_rewound_tests,
+        "sample_reuse_detected": bool(rewound_tests),
+    }
+
 # ---------------------------------------------------------------------------
 # Pre-mix statistics (byte-level, no external tools)
 # ---------------------------------------------------------------------------
@@ -193,23 +243,39 @@ def evaluate_nodes(sources):
 # Verdict (3-dimensional)
 # ---------------------------------------------------------------------------
 
-def build_verdict(ent_parsed, rng_parsed, dieharder_lines, node_health, premix):
+def build_verdict(ent_parsed, rng_parsed, dieharder_lines, node_health, premix, dieharder_analysis=None):
     alerts = []
+    dieharder_analysis = dieharder_analysis or {}
 
     # output_quality
     eb = ent_parsed.get("entropy_bits_per_byte")
-    dh_fail = any("FAILED" in l for l in dieharder_lines)
+    failed_rewound_tests = dieharder_analysis.get("failed_rewound_tests") or []
+    failed_non_rewound_tests = dieharder_analysis.get("failed_non_rewound_tests") or []
+    rewound_tests = dieharder_analysis.get("rewound_tests") or []
+    dh_fail = bool(failed_non_rewound_tests)
+    if not failed_rewound_tests and not failed_non_rewound_tests:
+        dh_fail = any("FAILED" in l for l in dieharder_lines)
     dh_weak = any("WEAK" in l for l in dieharder_lines)
     rf = rng_parsed.get("failures")
 
     if eb is None:
         oq = "FAIL"; alerts.append("ENT could not compute entropy — sample may be malformed.")
     elif eb > 7.999 and (rf == 0 or rf is None) and not dh_fail:
-        oq = "GOOD" if not dh_weak else "WARN"
+        oq = "GOOD" if not dh_weak and not failed_rewound_tests else "WARN"
     elif eb > 7.99 and not dh_fail:
         oq = "WARN"
     else:
         oq = "FAIL"; alerts.append("Statistical tests indicate non-random output.")
+
+    if failed_rewound_tests and not failed_non_rewound_tests:
+        alerts.append(
+            "Dieharder reported FAILED only on rewound sample file(s); treating this as low-confidence WARN, "
+            "not a hard output failure."
+        )
+    elif failed_rewound_tests:
+        alerts.append("Some Dieharder failures occurred after sample-file rewind; non-rewound failures still count.")
+    elif rewound_tests:
+        alerts.append("Dieharder rewound the sample file; some test results have reduced confidence.")
 
     # source_health
     if not node_health:
@@ -234,6 +300,8 @@ def build_verdict(ent_parsed, rng_parsed, dieharder_lines, node_health, premix):
         pe = premix.get("entropy_bits_per_byte", 0)
         if pe < 6.0:
             alerts.append(f"Pre-mix entropy low ({pe:.3f} bits/byte) — physical source may be degraded.")
+            ac = "WARN"
+        elif rewound_tests:
             ac = "WARN"
         else:
             ac = "GOOD"
@@ -359,7 +427,16 @@ def render_html(report):
     else:
         pm_html = '<div class="card" style="border-color:#f59e0b"><h2>Pre-mix sample</h2><p style="color:#f59e0b">⚠ Pre-mix data not available from this endpoint.</p></div>'
 
-    dh_items = "".join(f'<li><code>{html.escape(l)}</code></li>' for l in report["tests"]["dieharder"]["interesting_lines"]) or "<li>No PASSED/WEAK/FAILED lines</li>"
+    dh = report["tests"]["dieharder"]
+    dh_items = "".join(f'<li><code>{html.escape(l)}</code></li>' for l in dh["interesting_lines"]) or "<li>No PASSED/WEAK/FAILED lines</li>"
+    dh_rewound = dh.get("rewound_tests") or []
+    dh_rewound_html = ""
+    if dh_rewound:
+        dh_rewound_html = (
+            '<p class="muted" style="color:#f59e0b">Sample file rewound in Dieharder tests: '
+            f"<code>{html.escape(', '.join(map(str, dh_rewound)))}</code>. "
+            "Treat affected results as low confidence.</p>"
+        )
 
     pr_block = ""
     if "practrand" in report["tests"]:
@@ -392,7 +469,7 @@ def render_html(report):
 <body>
   <p><a href="./index.html">← Report index</a></p>
   <h1>Cryptographic entropy audit report</h1>
-  <p class="muted">Date: {html.escape(report['timestamp'])} | Source: <code>{html.escape(report['sample']['source'])}</code></p>
+  <p class="muted">Date: {html.escape(report['timestamp'])} | Profile: <code>{html.escape(str(report.get('audit_profile','daily')))}</code> | Source: <code>{html.escape(report['sample']['source'])}</code></p>
   <div class="note-box">ℹ {html.escape(v['note'])}</div>
 
   <div class="grid">
@@ -460,6 +537,7 @@ def render_html(report):
     <section class="card">
       <h2>Dieharder</h2>
       <p class="muted">Tests: {html.escape(", ".join(report['tests']['dieharder'].get('test_ids',[])))}</p>
+      {dh_rewound_html}
       <ul>{dh_items}</ul>
     </section>
     {pr_block}
@@ -588,8 +666,11 @@ def main():
         dh_raw, dh_dur, dh_rc = [], 0.0, 0
         for tid in DIEHARDER_TESTS:
             r = run_cmd(["dieharder", "-g", "201", "-f", str(sample_path), "-d", tid])
+            result_lines = summarize_dieharder(r["stdout"])
+            rewound = detect_dieharder_rewind(r["stdout"], r["stderr"])
             dh_raw.append({"test_id": tid, "returncode": r["returncode"],
-                           "stdout": r["stdout"], "stderr": r["stderr"], "duration_sec": r["duration_sec"]})
+                           "stdout": r["stdout"], "stderr": r["stderr"], "duration_sec": r["duration_sec"],
+                           "interesting_lines": result_lines, "rewound": rewound})
             dh_dur += r["duration_sec"]
             dh_rc = max(dh_rc, r["returncode"])
 
@@ -607,11 +688,10 @@ def main():
     sha512_bench = bench_sha512(sample["data"], SHA512_ROUNDS)
     ent_parsed = parse_ent(ent_r["stdout"])
     rng_parsed = parse_rngtest(rng_r["stdout"], rng_r["stderr"])
-    dh_lines = []
-    for item in dh_raw:
-        dh_lines.extend(summarize_dieharder(item["stdout"]))
+    dh_analysis = analyze_dieharder_runs(dh_raw)
+    dh_lines = dh_analysis["interesting_lines"]
 
-    verdict = build_verdict(ent_parsed, rng_parsed, dh_lines, node_health, pm_stats)
+    verdict = build_verdict(ent_parsed, rng_parsed, dh_lines, node_health, pm_stats, dh_analysis)
     verdict["alerts"] = alerts_early + verdict["alerts"]
 
     tests = {
@@ -623,6 +703,12 @@ def main():
                       "stage": "final"},
         "dieharder": {"duration_sec": round(dh_dur,3), "returncode": dh_rc,
                       "interesting_lines": dh_lines, "test_ids": DIEHARDER_TESTS,
+                      "rewound_tests": dh_analysis["rewound_tests"],
+                      "failed_tests": dh_analysis["failed_tests"],
+                      "weak_tests": dh_analysis["weak_tests"],
+                      "failed_rewound_tests": dh_analysis["failed_rewound_tests"],
+                      "failed_non_rewound_tests": dh_analysis["failed_non_rewound_tests"],
+                      "sample_reuse_detected": dh_analysis["sample_reuse_detected"],
                       "raw": dh_raw, "stage": "final"},
     }
     if pr_result:
@@ -633,6 +719,7 @@ def main():
 
     report = {
         "timestamp": timestamp,
+        "audit_profile": AUDIT_PROFILE,
         "pipeline_stages": {
             "raw_sdr":   "Physical RF noise from SDR nodes, before any processing",
             "pre_mix":   "After XOR-fold extractor, before SHA-512 conditioning — evaluated via premix_stats",
