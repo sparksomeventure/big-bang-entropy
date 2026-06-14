@@ -128,6 +128,10 @@ hardware selector, such as `RTL_SDR_INDEX`, `PLUTO_IP`, or `RX_CHANNEL`. The gen
 `NODE_NAME` as the unique key by default, while host and receiver details stay available as
 metadata.
 
+The starter compose includes an optional `sdr-node-2` service behind the `node-multi`
+profile. Configure the second receiver with `_2` variables such as `NODE_NAME_2`,
+`SDR_TYPE_2`, `FREQ_2`, and `RTL_SDR_INDEX_2`.
+
 Keep `NODE_NAME` in the `country-location-technology-radio-antennaNumber` convention, for
 example `pl-lub-sdr-ad9363-omni01`, `pl-lub-sdr-rtlsdr-loop01`, or
 `de-ber-sdr-hackrf-omni03`. Frequency bands belong in `FREQ`, not in the node name.

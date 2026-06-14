@@ -1,4 +1,5 @@
 import base64
+import ipaddress
 import atexit
 import hmac
 import hashlib
@@ -29,6 +30,24 @@ RAW_TELNET_PORT = int(os.getenv("RAW_TELNET_PORT", "1421"))
 RAW_HTTP_CHUNK = int(os.getenv("RAW_HTTP_CHUNK", "65536"))
 TELNET_SESSION_BYTES = int(os.getenv("TELNET_SESSION_BYTES", str(RAW_HTTP_CHUNK)))
 TELNET_MAX_BYTES_PER_SESSION = int(os.getenv("TELNET_MAX_BYTES_PER_SESSION", str(1024 * 1024)))
+# Trusted internal clients (e.g. audit containers in the Docker network) bypass the public
+# per-session byte cap and receive up to TELNET_TRUSTED_MAX_BYTES in a single session.
+# Set TELNET_TRUSTED_CIDRS to a comma-separated list of CIDR ranges to trust.
+# Default covers the typical Docker bridge / overlay ranges (172.16-31.x.x, 10.x.x.x).
+_TELNET_TRUSTED_CIDRS_RAW = os.getenv(
+    "TELNET_TRUSTED_CIDRS", "172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
+)
+TELNET_TRUSTED_CIDRS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+for _cidr in _TELNET_TRUSTED_CIDRS_RAW.split(","):
+    _cidr = _cidr.strip()
+    if _cidr:
+        try:
+            TELNET_TRUSTED_CIDRS.append(ipaddress.ip_network(_cidr, strict=False))
+        except ValueError:
+            pass
+TELNET_TRUSTED_MAX_BYTES = int(
+    os.getenv("TELNET_TRUSTED_MAX_BYTES", str(512 * 1024 * 1024))  # 512 MiB
+)
 STREAM_CHUNK_BYTES = int(os.getenv("STREAM_CHUNK_BYTES", str(64 * 1024)))
 STREAM_WAIT_TIMEOUT_SEC = float(os.getenv("STREAM_WAIT_TIMEOUT_SEC", "2.0"))
 STREAM_WAIT_INTERVAL_SEC = float(os.getenv("STREAM_WAIT_INTERVAL_SEC", "0.05"))
@@ -116,6 +135,15 @@ RAPIDAPI_PROTECTED_PREFIXES = tuple(
     for prefix in os.getenv("RAPIDAPI_PROTECTED_PREFIXES", "/v1/").split(",")
     if prefix.strip()
 ) or ("/v1/",)
+CAMERA_STREAM_NODE = os.getenv("CAMERA_STREAM_NODE", "").strip()
+CAMERA_STREAM_NAME = os.getenv("CAMERA_STREAM_NAME", "").strip()
+CAMERA_STREAM_LABEL = os.getenv("CAMERA_STREAM_LABEL", "Antenna camera").strip()
+CAMERA_STREAM_APP = os.getenv("CAMERA_STREAM_APP", "app").strip() or "app"
+CAMERA_WEBRTC_PROXY_PATH = (
+    os.getenv("CAMERA_WEBRTC_PROXY_PATH", "/ome-webrtc").strip().rstrip("/") or "/ome-webrtc"
+)
+CAMERA_WEBRTC_TRANSPORT = os.getenv("CAMERA_WEBRTC_TRANSPORT", "tcp").strip() or "tcp"
+CAMERA_STREAMS_JSON = os.getenv("CAMERA_STREAMS_JSON", "").strip()
 
 entropy_pool = bytearray()
 pool_lock = threading.Lock()
@@ -988,6 +1016,23 @@ def _effective_telnet_session_bytes() -> int:
     return min(max(1, TELNET_SESSION_BYTES), TELNET_MAX_BYTES_PER_SESSION)
 
 
+def _is_trusted_tcp_client(address) -> bool:
+    """Return True when the peer IP belongs to a trusted internal CIDR.
+
+    Trusted clients (e.g. audit / audit-weekly containers running in the same
+    Docker network) are served up to TELNET_TRUSTED_MAX_BYTES per session so
+    they can collect a full entropy sample without opening thousands of tiny
+    connections.
+    """
+    if not TELNET_TRUSTED_CIDRS:
+        return False
+    try:
+        peer_ip = ipaddress.ip_address(address[0])
+        return any(peer_ip in net for net in TELNET_TRUSTED_CIDRS)
+    except Exception:
+        return False
+
+
 def _store_waterfall(
     node_name: str,
     frame_id: str,
@@ -1431,8 +1476,12 @@ def udp_receiver_worker():
 def telnet_client_worker(conn: socket.socket, address):
     try:
         client_address = _resolve_tcp_client_address(conn, address)
-        log(f"[*] TCP entropy client connected from {client_address} via peer={address}")
-        session_bytes = _effective_telnet_session_bytes()
+        trusted = _is_trusted_tcp_client(address)
+        session_bytes = TELNET_TRUSTED_MAX_BYTES if trusted else _effective_telnet_session_bytes()
+        log(
+            f"[*] TCP entropy client connected from {client_address} via peer={address} "
+            f"trusted={trusted} session_limit={session_bytes}"
+        )
         data = _pop_entropy_chunk(session_bytes)
         if data is None:
             conn.sendall(b"Warming up...\n")
@@ -1442,7 +1491,7 @@ def telnet_client_worker(conn: socket.socket, address):
         conn.sendall(data)
         log(
             f"[*] TCP entropy client {client_address} served {len(data)} bytes "
-            f"(session_limit={session_bytes})"
+            f"(session_limit={session_bytes} trusted={trusted})"
         )
     except Exception as exc:
         log(f"[!] TCP entropy client error from {address}: {exc}")
@@ -1455,14 +1504,15 @@ def telnet_client_worker(conn: socket.socket, address):
 
 def raw_telnet_client_worker(conn: socket.socket, address):
     try:
-        log(f"[*] TCP RAW client connected from {address}")
-        session_bytes = _effective_telnet_session_bytes()
+        trusted = _is_trusted_tcp_client(address)
+        session_bytes = TELNET_TRUSTED_MAX_BYTES if trusted else _effective_telnet_session_bytes()
+        log(f"[*] TCP RAW client connected from {address} trusted={trusted} session_limit={session_bytes}")
         data = _pop_raw_chunk(session_bytes)
         if data is None:
             conn.sendall(b"Warming up raw pool...\n")
             return
         conn.sendall(data)
-        log(f"[*] TCP RAW client {address} served {len(data)} bytes")
+        log(f"[*] TCP RAW client {address} served {len(data)} bytes (trusted={trusted})")
     except Exception as exc:
         log(f"[!] TCP RAW client error from {address}: {exc}")
     finally:
@@ -1562,6 +1612,7 @@ def _rapidapi_secret_required_for_request() -> bool:
 def _build_health_payload():
     _cleanup_stale_nodes()
     sources_snapshot = _snapshot_sources()
+    camera_streams = _configured_camera_streams()
     with pool_lock:
         pool_bytes = len(entropy_pool)
     with waterfalls_lock:
@@ -1586,6 +1637,7 @@ def _build_health_payload():
         "udp_port": UDP_PORT,
         "nodes_with_waterfall": node_count,
         "source_nodes": source_nodes,
+        "camera_streams": len(camera_streams),
         "rejecting_source_nodes": rejecting_nodes,
         "source_audit_repeat_score_threshold": SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD,
         "source_audit_state_path": str(SOURCE_AUDIT_STATE_PATH),
@@ -1603,6 +1655,83 @@ def _build_health_payload():
         "random_max_bytes": RANDOM_MAX_BYTES,
         "rapidapi_enabled": RAPIDAPI_ENABLED,
     }
+
+
+def _camera_stream_payload(
+    *,
+    node: str,
+    stream: str,
+    label: str,
+    app: str,
+    proxy_path: str,
+    transport: str,
+) -> Dict[str, str]:
+    return {
+        "node": str(node).strip()[:128],
+        "stream": str(stream).strip()[:128],
+        "label": str(label).strip()[:128],
+        "app": str(app).strip().strip("/")[:64] or "app",
+        "webrtc_proxy_path": (str(proxy_path).strip().rstrip("/") or "/ome-webrtc")[:128],
+        "transport": str(transport).strip()[:32] or "tcp",
+    }
+
+
+def _configured_camera_streams() -> list[Dict[str, str]]:
+    streams: list[Dict[str, str]] = []
+
+    if CAMERA_STREAMS_JSON:
+        try:
+            configured = json.loads(CAMERA_STREAMS_JSON)
+        except json.JSONDecodeError as exc:
+            log(f"[!] Invalid CAMERA_STREAMS_JSON: {exc}")
+            configured = []
+
+        if isinstance(configured, dict):
+            configured = [configured]
+
+        if isinstance(configured, list):
+            for item in configured:
+                if not isinstance(item, dict):
+                    continue
+                node = str(item.get("node") or "").strip()
+                stream = str(item.get("stream") or item.get("name") or "").strip()
+                if not node and stream.endswith("-antenna"):
+                    node = stream[: -len("-antenna")]
+                if not stream and node:
+                    stream = f"{node}-antenna"
+                if not node or not stream:
+                    continue
+                streams.append(
+                    _camera_stream_payload(
+                        node=node,
+                        stream=stream,
+                        label=str(item.get("label") or CAMERA_STREAM_LABEL or stream),
+                        app=str(item.get("app") or CAMERA_STREAM_APP),
+                        proxy_path=str(item.get("webrtc_proxy_path") or CAMERA_WEBRTC_PROXY_PATH),
+                        transport=str(item.get("transport") or CAMERA_WEBRTC_TRANSPORT),
+                    )
+                )
+
+    if CAMERA_STREAM_NODE or CAMERA_STREAM_NAME:
+        node = CAMERA_STREAM_NODE
+        stream = CAMERA_STREAM_NAME
+        if not node and stream.endswith("-antenna"):
+            node = stream[: -len("-antenna")]
+        if not stream and node:
+            stream = f"{node}-antenna"
+        if node and stream and not any(item["node"] == node and item["stream"] == stream for item in streams):
+            streams.append(
+                _camera_stream_payload(
+                    node=node,
+                    stream=stream,
+                    label=CAMERA_STREAM_LABEL or stream,
+                    app=CAMERA_STREAM_APP,
+                    proxy_path=CAMERA_WEBRTC_PROXY_PATH,
+                    transport=CAMERA_WEBRTC_TRANSPORT,
+                )
+            )
+
+    return streams
 
 
 def _build_entropy_metrics_payload():
@@ -2008,6 +2137,11 @@ def list_source_audits():
             item["age_sec"] = round(now - state["updated_at"], 1) if state.get("updated_at") else None
             payload.append(item)
     return jsonify(payload)
+
+
+@app.route("/camera-streams")
+def list_camera_streams():
+    return jsonify(_configured_camera_streams())
 
 
 def _statistics_node_filter():
