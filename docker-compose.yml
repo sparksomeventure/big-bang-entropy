@@ -70,8 +70,12 @@ services:
       - AUDIT_CRON=${AUDIT_CRON:-17 5 * * *}
       - AUDIT_CHAIN_SECRET=${AUDIT_CHAIN_SECRET:-}
       - AUDIT_RUN_ON_START=${AUDIT_RUN_ON_START:-0}
+      - AUDIT_NONIID_ENABLED=0
+      - AUDIT_SIGNING_ENABLED=${AUDIT_SIGNING_ENABLED:-1}
+      - AUDIT_OTS_ENABLED=0
     volumes:
       - audit-reports:/reports
+      - audit-signing-key:/keys
     networks:
       - entropy-net
 
@@ -105,8 +109,14 @@ services:
       - AUDIT_CRON=${AUDIT_WEEKLY_CRON:-23 3 * * 0}
       - AUDIT_CHAIN_SECRET=${AUDIT_CHAIN_SECRET:-}
       - AUDIT_RUN_ON_START=${AUDIT_WEEKLY_RUN_ON_START:-0}
+      - AUDIT_NONIID_ENABLED=${AUDIT_NONIID_ENABLED:-1}
+      - AUDIT_NONIID_SAMPLE_BYTES=${AUDIT_NONIID_SAMPLE_BYTES:-1000000}
+      - AUDIT_SIGNING_ENABLED=${AUDIT_SIGNING_ENABLED:-1}
+      - AUDIT_OTS_ENABLED=${AUDIT_OTS_ENABLED:-1}
+      - AUDIT_OTS_MAX_UPGRADE_PER_RUN=${AUDIT_OTS_MAX_UPGRADE_PER_RUN:-10}
     volumes:
       - audit-reports:/reports
+      - audit-signing-key:/keys
     networks:
       - entropy-net
 
@@ -140,6 +150,7 @@ services:
       - UDP_TARGET_HOST=generator
       - UDP_TARGET_PORT=5005
       - SAMPLE_PACKET_BYTES=${SAMPLE_PACKET_BYTES:-12000}
+      - COMMIT_REVEAL_ENABLED=${COMMIT_REVEAL_ENABLED:-0}
       - RTL_READ_BYTES=${RTL_READ_BYTES:-262144}
       - ENTROPY_DECIMATION_FACTOR=${ENTROPY_DECIMATION_FACTOR:-4}
       - WATERFALL_INTERVAL_SEC=10
@@ -185,6 +196,7 @@ services:
       - UDP_TARGET_HOST=generator
       - UDP_TARGET_PORT=5005
       - SAMPLE_PACKET_BYTES=${SAMPLE_PACKET_BYTES_2:-12000}
+      - COMMIT_REVEAL_ENABLED=${COMMIT_REVEAL_ENABLED_2:-${COMMIT_REVEAL_ENABLED:-0}}
       - WATERFALL_INTERVAL_SEC=${WATERFALL_INTERVAL_SEC_2:-10}
       - WATERFALL_UDP_CHUNK_BYTES=${WATERFALL_UDP_CHUNK_BYTES_2:-48000}
       - WATERFALL_HISTORY_FRAMES=${WATERFALL_HISTORY_FRAMES_2:-5}
@@ -206,3 +218,6 @@ networks:
 
 volumes:
   audit-reports:
+  # Holds only the Ed25519 private signing key (audit/run_audit.py sign_chain_hash).
+  # Deliberately separate from audit-reports, which nginx serves publicly.
+  audit-signing-key:

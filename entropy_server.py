@@ -155,6 +155,16 @@ last_entropy_checkpoint_at = 0.0
 raw_pool = bytearray()
 raw_pool_lock = threading.Lock()
 
+# Per-node raw sample buffers, isolated from the combined raw_pool above, so an
+# auditor can pull one node's *unconditioned* stream in isolation. This is what
+# lets SP 800-90B min-entropy estimation run per source instead of on an
+# already-blended stream, where a dead/weak node can hide behind healthy ones.
+RAW_POOL_PER_NODE_MAX_BYTES = int(
+    os.getenv("RAW_POOL_PER_NODE_MAX_BYTES", str(4 * 1024 * 1024))
+)
+raw_pool_by_node: Dict[str, bytearray] = {}
+raw_pool_by_node_lock = threading.Lock()
+
 waterfalls: Dict[str, Dict[str, object]] = {}
 waterfalls_lock = threading.Lock()
 
@@ -171,6 +181,27 @@ node_runtime_stats_lock = threading.Lock()
 
 source_audits: Dict[str, Dict[str, object]] = {}
 source_audits_lock = threading.Lock()
+
+# Commit-then-reveal: opt-in per node (see sdr_node.py COMMIT_REVEAL_ENABLED).
+# Old nodes keep sending plain "samples" messages, handled exactly as before --
+# this is additive, not a replacement, so a mixed fleet during rollout is safe.
+# The commit table only ever holds a handful of short-lived epochs, so losing
+# it on a restart drops at most the last few seconds of in-flight commits,
+# unlike the single long-lived generator_state hash chain it feeds into.
+COMMIT_RETENTION_SEC = float(os.getenv("COMMIT_RETENTION_SEC", "30.0"))
+epoch_commits: Dict[int, Dict[str, Dict[str, object]]] = {}
+epoch_commits_lock = threading.Lock()
+
+node_commit_verification: Dict[str, Dict[str, object]] = {}
+node_commit_verification_lock = threading.Lock()
+
+commit_reveal_stats = {
+    "commits_received": 0,
+    "reveals_verified": 0,
+    "reveals_mismatched": 0,
+    "reveals_without_commit": 0,
+}
+commit_reveal_stats_lock = threading.Lock()
 
 metrics_node_buckets: Dict[tuple[int, str], Dict[str, object]] = {}
 metrics_system_buckets: Dict[int, Dict[str, object]] = {}
@@ -1166,6 +1197,15 @@ def _cleanup_stale_nodes(now: Optional[float] = None):
         for node_name in stale_waterfalls:
             del waterfalls[node_name]
 
+    with node_commit_verification_lock:
+        stale_commit_state = [
+            node_name
+            for node_name, state in node_commit_verification.items()
+            if state.get("updated_at", 0.0) < cutoff
+        ]
+        for node_name in stale_commit_state:
+            del node_commit_verification[node_name]
+
     if source_audits_changed:
         _persist_source_audits()
 
@@ -1180,6 +1220,10 @@ def _snapshot_sources():
     with node_runtime_stats_lock:
         runtime_snapshot = {
             node_name: dict(state) for node_name, state in node_runtime_stats.items()
+        }
+    with node_commit_verification_lock:
+        commit_verification_snapshot = {
+            node_name: dict(state) for node_name, state in node_commit_verification.items()
         }
     with node_stats_lock:
         payload = []
@@ -1211,9 +1255,132 @@ def _snapshot_sources():
                 "source_audit_age_sec": audit_summary["age_sec"],
                 "accepting_samples": audit_summary["accepting_samples"],
             }
+            commit_state = commit_verification_snapshot.get(node_name)
+            if commit_state:
+                item["commit_reveal_verified"] = commit_state.get("commit_reveal_verified")
+                item["commit_reveal_age_sec"] = round(now - commit_state["updated_at"], 1)
+            else:
+                item["commit_reveal_verified"] = None
+                item["commit_reveal_age_sec"] = None
             item.update(metadata)
             payload.append(item)
     return payload
+
+
+def _prune_old_epochs_locked():
+    """Drop commits whose reveal never showed up within COMMIT_RETENTION_SEC.
+    epoch_id is a client-chosen identifier (a per-node monotonic counter, not a
+    shared wall-clock bucket -- nodes don't need clock sync with the generator
+    for this to work), so pruning goes by each commit's own received_at instead
+    of comparing epoch_id values against each other."""
+    if not epoch_commits:
+        return
+    cutoff = time.time() - COMMIT_RETENTION_SEC
+    stale_epochs = [
+        epoch_id
+        for epoch_id, node_commits in epoch_commits.items()
+        if all(state.get("received_at", 0.0) < cutoff for state in node_commits.values())
+    ]
+    for epoch_id in stale_epochs:
+        del epoch_commits[epoch_id]
+
+
+def _record_commit_verification(node_name: str, verified: bool):
+    with node_commit_verification_lock:
+        node_commit_verification[node_name] = {
+            "commit_reveal_verified": verified,
+            "updated_at": time.time(),
+        }
+
+
+def _handle_epoch_commit(message: dict):
+    """First half of commit-then-reveal: a node declares, in advance, a hash
+    binding it to this epoch's raw sample + a nonce it hasn't disclosed yet.
+    Node-generated, so this only ever proves *that node* can't later swap in
+    different bytes for this epoch -- it does not (and cannot) protect against
+    a compromised generator process itself, which is a separate trust boundary.
+    """
+    node_name = message.get("node")
+    commit_hex = message.get("commit")
+    try:
+        epoch_id = int(message.get("epoch_id"))
+    except (TypeError, ValueError):
+        return
+    if not node_name or not commit_hex:
+        return
+
+    with epoch_commits_lock:
+        _prune_old_epochs_locked()
+        epoch_commits.setdefault(epoch_id, {})[str(node_name)] = {
+            "commit": str(commit_hex).lower(),
+            "byte_count": _optional_int(message.get("byte_count")) or 0,
+            "received_at": time.time(),
+        }
+    with commit_reveal_stats_lock:
+        commit_reveal_stats["commits_received"] += 1
+
+
+def _handle_epoch_reveal(message: dict):
+    """Second half of commit-then-reveal. Verifies the revealed bytes + nonce
+    hash to the commit recorded earlier for this node+epoch, then mixes the
+    sample in through the exact same _mix_samples_into_entropy path a legacy
+    "samples" message would use -- commit-reveal only gates *whether* a reveal
+    is trusted, it changes nothing about how trusted data gets conditioned.
+    """
+    node_name = message.get("node")
+    nonce_hex = message.get("nonce")
+    payload_b64 = message.get("payload_b64")
+    try:
+        epoch_id = int(message.get("epoch_id"))
+    except (TypeError, ValueError):
+        return
+    if not node_name or not nonce_hex or not payload_b64:
+        return
+    try:
+        raw_payload = base64.b64decode(payload_b64)
+        nonce = bytes.fromhex(nonce_hex)
+    except Exception:
+        return
+    if not raw_payload:
+        return
+
+    node_name = str(node_name)
+    source_timestamp = float(message.get("timestamp", time.time()))
+
+    with epoch_commits_lock:
+        node_commit = (epoch_commits.get(epoch_id) or {}).pop(node_name, None)
+
+    if node_commit is not None:
+        expected = hashlib.sha256(
+            f"{epoch_id}:{node_name}".encode("utf-8") + raw_payload + nonce
+        ).hexdigest()
+        if not hmac.compare_digest(expected, node_commit["commit"]):
+            log(f"[!] Commit/reveal mismatch for node={node_name} epoch={epoch_id} — rejecting reveal.")
+            _update_node_stats(node_name, len(raw_payload), 0, rejected=True)
+            with commit_reveal_stats_lock:
+                commit_reveal_stats["reveals_mismatched"] += 1
+            return
+        commit_verified = True
+        with commit_reveal_stats_lock:
+            commit_reveal_stats["reveals_verified"] += 1
+    else:
+        # No matching commit: either a legacy node that never adopted
+        # commit-reveal but somehow sent a reveal (shouldn't happen -- legacy
+        # nodes send "samples", not "epoch_reveal"), or the commit already
+        # expired from the retention window. Accept the data rather than
+        # discard real entropy, but mark it unverified in node_commit_verification.
+        commit_verified = False
+        with commit_reveal_stats_lock:
+            commit_reveal_stats["reveals_without_commit"] += 1
+
+    if not _node_accepts_samples(node_name):
+        _update_node_stats(node_name, len(raw_payload), 0, rejected=True)
+        log(f"[!] Rejecting samples from node={node_name} due to source audit repeat threshold.")
+        return
+
+    _update_node_stats(node_name, len(raw_payload), len(raw_payload))
+    _record_commit_verification(node_name, commit_verified)
+    _mix_samples_into_entropy(node_name, raw_payload, source_timestamp)
 
 
 def _mix_samples_into_entropy(node_name: str, raw_samples: bytes, source_timestamp: float):
@@ -1222,26 +1389,39 @@ def _mix_samples_into_entropy(node_name: str, raw_samples: bytes, source_timesta
     if not raw_samples:
         return
 
+    # Vetted conditioning per NIST SP 800-90B §3.1.5.1.2 / SP 800-90C: HMAC keyed
+    # by the running state is a proven randomness extractor (Dodis, Gennaro,
+    # Krawczyk et al., "Randomness Extraction and Key Derivation Using the CBC,
+    # Cascade and HMAC Modes") even when the key itself is not uniform, unlike a
+    # bare SHA-512(state || data) concatenation hash which has no such proof.
+    # The node label and capture timestamp carry no entropy claim, so they stay
+    # out of the keyed input entirely -- n_in for the conditioning-entropy
+    # accounting (see audit/run_audit.py, ea_conditioning) is exactly
+    # MIX_BLOCK_BYTES*8 bits per HMAC call, nothing more, nothing hidden.
     processed_output = bytearray()
     with generator_state_lock:
         local_state = generator_state
         for offset in range(0, len(raw_samples), MIX_BLOCK_BYTES):
             block = raw_samples[offset : offset + MIX_BLOCK_BYTES]
-            hasher = hashlib.sha512(local_state)
-            hasher.update(node_name.encode("utf-8"))
-            hasher.update(str(source_timestamp).encode("utf-8"))
-            hasher.update(block)
-            hasher.update(str(time.time_ns()).encode("utf-8"))
-            local_state = hasher.digest()
+            local_state = hmac.new(local_state, block, hashlib.sha512).digest()
             processed_output.extend(local_state)
         generator_state = local_state
 
     _store_entropy(processed_output)
-    
-    # Store raw samples for auditing (Stage 2)
+
+    # Store raw (unconditioned) samples for auditing: one combined pool used by
+    # the existing pre-mix statistical tests, and one buffer per node so a
+    # per-source SP 800-90B min-entropy estimate can be computed in isolation --
+    # a conditioner can make a dead or weak source look fine in aggregate.
     with raw_pool_lock:
         raw_pool.extend(raw_samples)
         _clamp_raw_pool()
+    with raw_pool_by_node_lock:
+        node_buffer = raw_pool_by_node.setdefault(node_name, bytearray())
+        node_buffer.extend(raw_samples)
+        excess = len(node_buffer) - RAW_POOL_PER_NODE_MAX_BYTES
+        if excess > 0:
+            del node_buffer[:excess]
 
 
 def cleanup_incomplete_images_worker():
@@ -1465,6 +1645,10 @@ def udp_receiver_worker():
                 continue
             _update_node_stats(node_name, len(raw_payload), len(raw_payload))
             _mix_samples_into_entropy(node_name, raw_payload, source_timestamp)
+        elif msg_type == "epoch_commit":
+            _handle_epoch_commit(message)
+        elif msg_type == "epoch_reveal":
+            _handle_epoch_reveal(message)
         elif msg_type == "waterfall":
             _handle_waterfall_part(message)
         elif msg_type == "source_audit":
@@ -1475,22 +1659,57 @@ def udp_receiver_worker():
 
 def telnet_client_worker(conn: socket.socket, address):
     try:
+        # Trust must be decided on the real originating client (resolved from the
+        # PROXY protocol header when present), never on the raw socket peer: when
+        # traffic arrives via the nginx TCP proxy, the raw peer is always nginx's
+        # own docker-network address, which falls inside the trusted CIDRs and
+        # would otherwise grant every public caller a multi-hundred-MB session.
         client_address = _resolve_tcp_client_address(conn, address)
-        trusted = _is_trusted_tcp_client(address)
+        trusted = _is_trusted_tcp_client(client_address)
         session_bytes = TELNET_TRUSTED_MAX_BYTES if trusted else _effective_telnet_session_bytes()
         log(
             f"[*] TCP entropy client connected from {client_address} via peer={address} "
             f"trusted={trusted} session_limit={session_bytes}"
         )
-        data = _pop_entropy_chunk(session_bytes)
-        if data is None:
-            conn.sendall(b"Warming up...\n")
-            log(f"[*] TCP entropy client {client_address} got warmup response")
+
+        if not trusted:
+            data = _pop_entropy_chunk(session_bytes)
+            if data is None:
+                conn.sendall(b"Warming up...\n")
+                log(f"[*] TCP entropy client {client_address} got warmup response")
+                return
+            conn.sendall(data)
+            log(
+                f"[*] TCP entropy client {client_address} served {len(data)} bytes "
+                f"(session_limit={session_bytes} trusted={trusted})"
+            )
             return
 
-        conn.sendall(data)
+        # Trusted sessions can request up to TELNET_TRUSTED_MAX_BYTES. Stream it in
+        # bounded chunks instead of popping/sending it as one giant blob: assembling
+        # a multi-hundred-MB (or larger) bytes object in one shot multiplies peak
+        # memory several times over (pool slice + bytes copy + send buffer), which
+        # is what was OOM-killing the process on hosts with limited RAM.
+        remaining = session_bytes
+        served = 0
+        wait_started = time.time()
+        while remaining > 0:
+            chunk = _pop_entropy_chunk_up_to(min(STREAM_CHUNK_BYTES, remaining))
+            if chunk is None:
+                if served == 0:
+                    conn.sendall(b"Warming up...\n")
+                    log(f"[*] TCP entropy client {client_address} got warmup response")
+                    return
+                if time.time() - wait_started >= STREAM_WAIT_TIMEOUT_SEC:
+                    break
+                time.sleep(STREAM_WAIT_INTERVAL_SEC)
+                continue
+            conn.sendall(chunk)
+            served += len(chunk)
+            remaining -= len(chunk)
+            wait_started = time.time()
         log(
-            f"[*] TCP entropy client {client_address} served {len(data)} bytes "
+            f"[*] TCP entropy client {client_address} served {served} bytes "
             f"(session_limit={session_bytes} trusted={trusted})"
         )
     except Exception as exc:
@@ -1621,6 +1840,8 @@ def _build_health_payload():
     rejecting_nodes = sum(
         1 for source in sources_snapshot if not source.get("accepting_samples", True)
     )
+    with commit_reveal_stats_lock:
+        commit_reveal_snapshot = dict(commit_reveal_stats)
     return {
         "status": "ok",
         "pool_bytes": pool_bytes,
@@ -1639,6 +1860,8 @@ def _build_health_payload():
         "source_nodes": source_nodes,
         "camera_streams": len(camera_streams),
         "rejecting_source_nodes": rejecting_nodes,
+        "commit_reveal": commit_reveal_snapshot,
+        "commit_retention_sec": COMMIT_RETENTION_SEC,
         "source_audit_repeat_score_threshold": SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD,
         "source_audit_state_path": str(SOURCE_AUDIT_STATE_PATH),
         "entropy_persistence_enabled": _entropy_persistence_enabled(),
@@ -2137,6 +2360,49 @@ def list_source_audits():
             item["age_sec"] = round(now - state["updated_at"], 1) if state.get("updated_at") else None
             payload.append(item)
     return jsonify(payload)
+
+
+def _is_trusted_http_client() -> bool:
+    """HTTP counterpart of _is_trusted_tcp_client. Safe to key off request.remote_addr
+    here (unlike the raw TCP peer, see telnet_client_worker) because ProxyFix on `app`
+    already resolves it from X-Forwarded-For through exactly TRUSTED_PROXY_HOPS hops,
+    so a public caller proxied through nginx cannot present as an internal address."""
+    if not TELNET_TRUSTED_CIDRS:
+        return False
+    try:
+        peer_ip = ipaddress.ip_address(request.remote_addr)
+        return any(peer_ip in net for net in TELNET_TRUSTED_CIDRS)
+    except (ValueError, TypeError):
+        return False
+
+
+@app.route("/internal/raw-sample/<node_name>")
+def internal_raw_sample(node_name: str):
+    """Unconditioned per-node sample, for SP 800-90B min-entropy estimation only.
+    Restricted to internal callers (the audit container) -- this is raw source
+    output, not a public entropy endpoint."""
+    if not _is_trusted_http_client():
+        return jsonify({"error": "forbidden"}), 403
+
+    try:
+        requested_bytes = int(request.args.get("bytes", RAW_POOL_PER_NODE_MAX_BYTES))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid_bytes_parameter"}), 400
+    requested_bytes = max(1, min(requested_bytes, RAW_POOL_PER_NODE_MAX_BYTES))
+
+    with raw_pool_by_node_lock:
+        buffer = raw_pool_by_node.get(node_name)
+        available = bytes(buffer) if buffer else b""
+
+    if not available:
+        return jsonify({"error": "no_raw_samples_for_node", "node": node_name}), 404
+
+    data = available[-requested_bytes:]
+    return Response(
+        data,
+        mimetype="application/octet-stream",
+        headers={"X-Sample-Bytes": str(len(data)), "X-Node": node_name},
+    )
 
 
 @app.route("/camera-streams")

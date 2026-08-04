@@ -24,6 +24,33 @@ PRACTRAND_TLMAX   = os.getenv("AUDIT_PRACTRAND_TLMAX", "256M")
 PRACTRAND_MAX_BYTES = int(os.getenv("AUDIT_PRACTRAND_MAX_BYTES", str(32 * 1024 * 1024)))
 THROUGHPUT_WARN   = float(os.getenv("AUDIT_THROUGHPUT_WARN_MIB", "0.5"))
 
+# NIST SP 800-90B non-IID min-entropy estimation, per source node. Heavyweight
+# (~10s/MB/node), so this only runs on the weekly profile, and only if the
+# vendored NIST binaries are actually present in the image (see Dockerfile.audit).
+NONIID_ENABLED         = os.getenv("AUDIT_NONIID_ENABLED", "0") == "1"
+NONIID_SAMPLE_BYTES    = int(os.getenv("AUDIT_NONIID_SAMPLE_BYTES", "1000000"))
+NONIID_TOOL_PATH       = os.getenv("AUDIT_NONIID_TOOL_PATH", "/usr/local/bin/ea_non_iid")
+CONDITIONING_TOOL_PATH = os.getenv("AUDIT_CONDITIONING_TOOL_PATH", "/usr/local/bin/ea_conditioning")
+# HMAC-SHA-512 digest width used by entropy_server.py's conditioning step.
+CONDITIONING_OUTPUT_BITS   = 512
+NONIID_MIN_USEFUL_BYTES    = 100_000
+NONIID_RECOMMENDED_BYTES   = 1_000_000
+
+# Ed25519 signing of the chain hash: publicly verifiable against a published
+# public key, unlike AUDIT_CHAIN_SECRET/HMAC below which only proves integrity
+# to someone who already trusts this operator with the shared secret.
+SIGNING_ENABLED   = os.getenv("AUDIT_SIGNING_ENABLED", "1") == "1"
+SIGNING_KEY_PATH  = Path(os.getenv("AUDIT_SIGNING_KEY_PATH", "/keys/chain_ed25519.key"))
+
+# OpenTimestamps: periodically anchors the chain hash to the Bitcoin blockchain
+# via public calendar servers, so the report chain's existence at a point in
+# time can be proven without trusting this operator at all. Weekly profile
+# only -- calendar submission is a network call, and Bitcoin confirmation is
+# hours away by design, not something worth doing on every daily run.
+OTS_ENABLED               = os.getenv("AUDIT_OTS_ENABLED", "0") == "1"
+OTS_BIN                   = os.getenv("AUDIT_OTS_BIN", "ots")
+OTS_MAX_UPGRADE_PER_RUN   = int(os.getenv("AUDIT_OTS_MAX_UPGRADE_PER_RUN", "10"))
+
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 CHAIN_PATH  = REPORTS_DIR / "chain.jsonl"
 INDEX_PATH  = REPORTS_DIR / "index.html"
@@ -36,6 +63,128 @@ LATEST_PATH = REPORTS_DIR / "latest.json"
 def http_json(url):
     with urlopen(url, timeout=10) as r:
         return json.loads(r.read().decode())
+
+def http_bytes(url, timeout=60):
+    with urlopen(url, timeout=timeout) as r:
+        return r.read()
+
+# ---------------------------------------------------------------------------
+# SP 800-90B min-entropy estimation (weekly profile only)
+# ---------------------------------------------------------------------------
+
+_H_MIN_COMBINED_RE = re.compile(r"^min\(H_original, 8 X H_bitstring\):\s*([0-9.]+)", re.MULTILINE)
+_H_ORIGINAL_RE     = re.compile(r"^H_original:\s*([0-9.]+)", re.MULTILINE)
+_VETTED_H_OUT_RE   = re.compile(r"\(Vetted\) h_out\s*=\s*([0-9.]+)")
+
+def fetch_node_raw_sample(node_name, n_bytes):
+    url = f"{TARGET_HTTP_URL}/internal/raw-sample/{node_name}?bytes={n_bytes}"
+    return http_bytes(url)
+
+def run_non_iid_estimate(sample_path, bits_per_symbol=8):
+    """Run NIST's ea_non_iid (non-IID track, SP 800-90B §6) and take the same
+    conservative bound the standard prescribes: min(H_original, 8 x H_bitstring)
+    when both are available, falling back to H_original for byte-oriented data."""
+    r = run_cmd([NONIID_TOOL_PATH, "-i", str(sample_path), str(bits_per_symbol)])
+    stdout = r["stdout"]
+    m = _H_MIN_COMBINED_RE.search(stdout) or _H_ORIGINAL_RE.search(stdout)
+    h_min = float(m.group(1)) if m else None
+    return {
+        "returncode": r["returncode"],
+        "duration_sec": r["duration_sec"],
+        "bits_per_symbol": bits_per_symbol,
+        "h_min_bits_per_symbol": h_min,
+        "stdout_tail": "\n".join(stdout.strip().splitlines()[-6:]),
+    }
+
+def run_conditioning_bound(n_in_bits, n_out_bits, narrow_width_bits, h_in_bits):
+    """Formal SP 800-90C vetted-conditioning bound (ea_conditioning -v): how much
+    of the estimated input entropy survives HMAC-SHA-512 conditioning per block."""
+    h_in_int = max(0, min(int(h_in_bits), n_in_bits))
+    r = run_cmd([
+        CONDITIONING_TOOL_PATH, "-v",
+        str(n_in_bits), str(n_out_bits), str(narrow_width_bits), str(h_in_int),
+    ])
+    m = _VETTED_H_OUT_RE.search(r["stdout"])
+    return {
+        "returncode": r["returncode"],
+        "n_in_bits": n_in_bits,
+        "n_out_bits": n_out_bits,
+        "narrow_width_bits": narrow_width_bits,
+        "h_in_bits": h_in_int,
+        "h_out_bits": float(m.group(1)) if m else None,
+        "stdout": r["stdout"].strip(),
+    }
+
+def run_entropy_assessment(sources_raw, mix_block_bytes):
+    """SP 800-90B non-IID min-entropy estimate per currently-accepting source
+    node, on its own unconditioned raw stream (never the blended/final output --
+    a conditioner can make a dead or weak source look fine in aggregate). Paired
+    with the SP 800-90C vetted-conditioning bound so the report states, in bits,
+    how much of that entropy the generator is actually allowed to claim after
+    HMAC-SHA-512 mixing. Returns None if disabled or the NIST binaries are
+    missing from this image (older audit images before this feature shipped)."""
+    if not NONIID_ENABLED:
+        return None
+    if not (Path(NONIID_TOOL_PATH).exists() and Path(CONDITIONING_TOOL_PATH).exists()):
+        return {"error": "NIST SP800-90B_EntropyAssessment binaries not present in this image"}
+
+    active_nodes = sorted({
+        str(item.get("node") or item.get("node_id"))
+        for item in sources_raw
+        if item.get("accepting_samples", True) and (item.get("node") or item.get("node_id"))
+    })
+
+    n_in_bits = mix_block_bytes * 8
+    n_out_bits = CONDITIONING_OUTPUT_BITS
+    narrow_width_bits = min(n_in_bits, n_out_bits)
+
+    nodes_result = {}
+    for node in active_nodes:
+        try:
+            raw = fetch_node_raw_sample(node, NONIID_SAMPLE_BYTES)
+        except Exception as e:
+            nodes_result[node] = {"error": f"raw sample fetch failed: {e}"}
+            continue
+        if len(raw) < NONIID_MIN_USEFUL_BYTES:
+            nodes_result[node] = {
+                "error": f"raw sample too small for a meaningful estimate "
+                         f"({len(raw)} bytes, need >= {NONIID_MIN_USEFUL_BYTES})",
+            }
+            continue
+
+        with tempfile.NamedTemporaryFile(prefix="audit-noniid-", suffix=".bin", delete=False) as tmp:
+            tmp.write(raw)
+            sample_path = Path(tmp.name)
+        try:
+            estimate = run_non_iid_estimate(sample_path, bits_per_symbol=8)
+        finally:
+            sample_path.unlink(missing_ok=True)
+
+        node_result = {
+            "sample_bytes": len(raw),
+            "below_nist_recommended_minimum": len(raw) < NONIID_RECOMMENDED_BYTES,
+            "min_entropy": estimate,
+        }
+
+        h_min_per_byte = estimate.get("h_min_bits_per_symbol")
+        if h_min_per_byte is not None:
+            h_in_bits = h_min_per_byte * mix_block_bytes
+            conditioning = run_conditioning_bound(n_in_bits, n_out_bits, narrow_width_bits, h_in_bits)
+            node_result["conditioning"] = conditioning
+            h_out = conditioning.get("h_out_bits")
+            if h_out is not None:
+                node_result["certified_output_entropy_bits_per_byte"] = round(h_out / (n_out_bits / 8), 6)
+
+        nodes_result[node] = node_result
+
+    return {
+        "profile": "NIST SP 800-90B non-IID track + SP 800-90C vetted conditioning",
+        "tool": "usnistgov/SP800-90B_EntropyAssessment",
+        "sample_bytes_requested": NONIID_SAMPLE_BYTES,
+        "mix_block_bytes": mix_block_bytes,
+        "conditioning_output_bits": n_out_bits,
+        "nodes": nodes_result,
+    }
 
 # ---------------------------------------------------------------------------
 # TCP sample fetch
@@ -50,20 +199,29 @@ def fetch_sample_via_tcp(target_bytes, port=None):
             timed_out = True
             break
         sessions += 1
-        with socket.create_connection((TARGET_HOST, port or TARGET_TCP_PORT), timeout=SOCKET_TIMEOUT) as s:
-            s.settimeout(SOCKET_TIMEOUT)
-            part = bytearray()
-            while True:
-                if FETCH_MAX_SEC > 0 and time.perf_counter() - started >= FETCH_MAX_SEC:
-                    timed_out = True
-                    break
-                try:
-                    d = s.recv(65536)
-                except socket.timeout:
-                    break
-                if not d:
-                    break
-                part.extend(d)
+        part = bytearray()
+        try:
+            with socket.create_connection((TARGET_HOST, port or TARGET_TCP_PORT), timeout=SOCKET_TIMEOUT) as s:
+                s.settimeout(SOCKET_TIMEOUT)
+                while True:
+                    if FETCH_MAX_SEC > 0 and time.perf_counter() - started >= FETCH_MAX_SEC:
+                        timed_out = True
+                        break
+                    try:
+                        d = s.recv(65536)
+                    except OSError:
+                        # Covers socket.timeout as well as a mid-session drop (e.g. the
+                        # generator getting killed/restarted): treat it like a closed
+                        # session and keep whatever was already read, rather than
+                        # crashing the whole audit run with no report written.
+                        break
+                    if not d:
+                        break
+                    part.extend(d)
+        except OSError:
+            # Connection could not even be established this round (generator
+            # restarting); fall through and retry with a fresh session.
+            pass
         if not part or part == b"Warming up...\n":
             if part == b"Warming up...\n":
                 time.sleep(1.0)
@@ -203,6 +361,105 @@ def premix_stats(data: bytes):
         "byte_mean": round(byte_mean, 4),
         "bit_balance": round(bit_balance, 6),
     }
+
+# ---------------------------------------------------------------------------
+# Ed25519 chain signature (publicly verifiable, unlike the HMAC below)
+# ---------------------------------------------------------------------------
+
+def _load_or_create_signing_key():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    SIGNING_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if SIGNING_KEY_PATH.exists():
+        return Ed25519PrivateKey.from_private_bytes(SIGNING_KEY_PATH.read_bytes())
+
+    private_key = Ed25519PrivateKey.generate()
+    raw = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    SIGNING_KEY_PATH.write_bytes(raw)
+    SIGNING_KEY_PATH.chmod(0o600)
+    return private_key
+
+def sign_chain_hash(chain_hash: str) -> dict:
+    """Ed25519 signature over chain_hash. The private key lives only in the
+    signing-key volume (never the public reports volume); the public key is
+    published alongside the reports so any third party can verify the chain
+    without trusting this operator with a shared secret, unlike chain_hmac."""
+    if not SIGNING_ENABLED:
+        return {}
+    try:
+        from cryptography.hazmat.primitives import serialization
+
+        private_key = _load_or_create_signing_key()
+        public_bytes = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        signature = private_key.sign(chain_hash.encode("utf-8"))
+        pubkey_hex = public_bytes.hex()
+
+        pubkey_path = REPORTS_DIR / "chain_ed25519_pubkey.txt"
+        if not pubkey_path.exists() or pubkey_path.read_text().strip() != pubkey_hex:
+            pubkey_path.write_text(pubkey_hex + "\n", encoding="utf-8")
+
+        return {
+            "chain_signature_algorithm": "Ed25519",
+            "chain_signature": signature.hex(),
+            "chain_public_key": pubkey_hex,
+            "chain_public_key_fingerprint": hashlib.sha256(public_bytes).hexdigest()[:16],
+        }
+    except Exception as e:
+        return {"chain_signature_error": str(e)}
+
+# ---------------------------------------------------------------------------
+# OpenTimestamps anchoring (weekly profile only)
+# ---------------------------------------------------------------------------
+
+def run_opentimestamps_anchor(slug: str, chain_hash: str) -> dict:
+    """Best-effort: stamp this report's chain_hash with OpenTimestamps and try
+    to upgrade previously-pending proofs to a full Bitcoin Merkle proof. Never
+    raises -- a calendar server hiccup should not take down the whole audit run,
+    and an unconfirmed .ots proof is expected (Bitcoin confirmation takes hours),
+    not a failure."""
+    result = {"enabled": True, "stamp": None, "upgrades": []}
+
+    hash_path = REPORTS_DIR / f"{slug}-chain-hash.txt"
+    ots_path = hash_path.with_name(hash_path.name + ".ots")
+    try:
+        hash_path.write_text(chain_hash + "\n", encoding="utf-8")
+        r = run_cmd([OTS_BIN, "stamp", str(hash_path)])
+        result["stamp"] = {
+            "returncode": r["returncode"],
+            "proof_file": ots_path.name if ots_path.exists() else None,
+            "stderr_tail": "\n".join(r["stderr"].strip().splitlines()[-4:]),
+        }
+    except Exception as e:
+        result["stamp"] = {"error": str(e)}
+
+    try:
+        # Exclude the proof stamped just above -- it was only submitted to the
+        # calendar servers a moment ago, an upgrade attempt this soon would be
+        # pointless (Bitcoin confirmation is hours away by design).
+        just_stamped_name = ots_path.name
+        pending = [
+            p for p in sorted(REPORTS_DIR.glob("*-chain-hash.txt.ots"))
+            if p.name != just_stamped_name
+        ]
+        for pending_path in pending[-OTS_MAX_UPGRADE_PER_RUN:]:
+            r = run_cmd([OTS_BIN, "upgrade", str(pending_path)])
+            result["upgrades"].append({
+                "file": pending_path.name,
+                "returncode": r["returncode"],
+                "output_tail": "\n".join(r["stdout"].strip().splitlines()[-3:]),
+            })
+    except Exception as e:
+        result["upgrades_error"] = str(e)
+
+    return result
 
 # ---------------------------------------------------------------------------
 # Node health
@@ -623,6 +880,21 @@ def main():
     if any(not item.get("accepting_samples", True) for item in source_audits):
         alerts_early.append("One or more SDR nodes are currently blocked by the raw source audit repeat threshold.")
 
+    entropy_assessment = None
+    if AUDIT_PROFILE == "weekly":
+        try:
+            entropy_assessment = run_entropy_assessment(sources_raw, healthz.get("mix_block_bytes", 64))
+        except Exception as e:
+            alerts_early.append(f"SP 800-90B entropy assessment failed: {e}")
+    if entropy_assessment and not entropy_assessment.get("error"):
+        for node, result in entropy_assessment.get("nodes", {}).items():
+            h_min = (result.get("min_entropy") or {}).get("h_min_bits_per_symbol")
+            if h_min is not None and h_min < 1.0:
+                alerts_early.append(
+                    f"SP 800-90B min-entropy for node {node} is critically low "
+                    f"({h_min:.3f} bits/byte)."
+                )
+
     # fetch final sample (post SHA-512) — stage 3
     sample = fetch_sample_via_tcp(SAMPLE_SIZE, port=TARGET_TCP_PORT)
     if sample["bytes"] <= 0:
@@ -736,6 +1008,7 @@ def main():
             "sha256": sample_sha256,
         },
         "premix_stats": pm_stats,
+        "entropy_assessment": entropy_assessment,
         "node_health": node_health,
         "source_audits": source_audits,
         "healthz": healthz,
@@ -757,9 +1030,17 @@ def main():
     chain_hmac = None
     if CHAIN_SECRET:
         chain_hmac = hmac.new(CHAIN_SECRET.encode(), chain_hash.encode(), hashlib.sha256).hexdigest()
+    signature_fields = sign_chain_hash(chain_hash)
 
     report["integrity"] = {"prev_chain_hash": prev_hash, "report_sha256": report_sha256,
-                           "chain_hash": chain_hash, "chain_hmac": chain_hmac}
+                           "chain_hash": chain_hash, "chain_hmac": chain_hmac,
+                           **signature_fields}
+
+    if AUDIT_PROFILE == "weekly" and OTS_ENABLED:
+        try:
+            report["integrity"]["opentimestamps"] = run_opentimestamps_anchor(slug, chain_hash)
+        except Exception as e:
+            report["integrity"]["opentimestamps"] = {"error": str(e)}
 
     rjp = REPORTS_DIR / f"{slug}-report.json"
     rhp = REPORTS_DIR / f"{slug}-report.html"

@@ -3,6 +3,7 @@ import binascii
 import ctypes
 import argparse
 import gc
+import hashlib
 import io
 import json
 import math
@@ -51,6 +52,15 @@ SDR_DEVICE_ID = os.getenv("SDR_DEVICE_ID", "").strip()
 UDP_TARGET_HOST = os.getenv("UDP_TARGET_HOST", "generator")
 UDP_TARGET_PORT = int(os.getenv("UDP_TARGET_PORT", "5005"))
 SAMPLE_PACKET_BYTES = int(os.getenv("SAMPLE_PACKET_BYTES", "12000"))
+# Opt-in: commit to a packet's hash before revealing its bytes, so this node
+# can't later have a different payload substituted for a packet it already
+# declared, and the generator can prove exactly what each node contributed.
+# Off by default -- requires a generator build that understands epoch_commit /
+# epoch_reveal (see entropy_server.py _handle_epoch_commit); older generators
+# simply ignore unknown message types, so turning this on against an old
+# generator silently drops that node's entropy rather than corrupting anything,
+# which is still why it defaults off until both sides have rolled out.
+COMMIT_REVEAL_ENABLED = os.getenv("COMMIT_REVEAL_ENABLED", "0").lower() in ("1", "true", "yes")
 WATERFALL_INTERVAL_SEC = int(os.getenv("WATERFALL_INTERVAL_SEC", "10"))
 WATERFALL_UDP_CHUNK_BYTES = int(os.getenv("WATERFALL_UDP_CHUNK_BYTES", "48000"))
 WATERFALL_HISTORY_FRAMES = int(os.getenv("WATERFALL_HISTORY_FRAMES", "5"))
@@ -686,6 +696,62 @@ def udp_send(sock: socket.socket, message: dict):
     sock.sendto(payload, (UDP_TARGET_HOST, UDP_TARGET_PORT))
 
 
+_epoch_counter = 0
+
+
+def _next_epoch_id() -> int:
+    """A per-node monotonic counter, not a wall-clock bucket: the generator
+    only uses it to pair a reveal with its earlier commit, never to reason
+    about timing, so nodes don't need clock sync with the generator for
+    commit-then-reveal to work."""
+    global _epoch_counter
+    _epoch_counter += 1
+    return _epoch_counter
+
+
+def send_sample_chunk(sock: socket.socket, chunk: bytes):
+    if not COMMIT_REVEAL_ENABLED:
+        udp_send(
+            sock,
+            {
+                "type": "samples",
+                **node_identity_payload(),
+                "payload_b64": base64.b64encode(chunk).decode("ascii"),
+                "raw_bytes": len(chunk),
+                "timestamp": time.time(),
+            },
+        )
+        return
+
+    epoch_id = _next_epoch_id()
+    nonce = os.urandom(16)
+    commit = hashlib.sha256(
+        f"{epoch_id}:{NODE_ID}".encode("utf-8") + chunk + nonce
+    ).hexdigest()
+    udp_send(
+        sock,
+        {
+            "type": "epoch_commit",
+            "node": NODE_ID,
+            "epoch_id": epoch_id,
+            "commit": commit,
+            "byte_count": len(chunk),
+            "timestamp": time.time(),
+        },
+    )
+    udp_send(
+        sock,
+        {
+            "type": "epoch_reveal",
+            "node": NODE_ID,
+            "epoch_id": epoch_id,
+            "nonce": nonce.hex(),
+            "payload_b64": base64.b64encode(chunk).decode("ascii"),
+            "timestamp": time.time(),
+        },
+    )
+
+
 def raw_signal_samples(raw_iq: bytes):
     dtype = np.uint8 if SDR_TYPE == "rtlsdr" else np.int16
     itemsize = np.dtype(dtype).itemsize
@@ -991,16 +1057,7 @@ def entropy_sender_worker(source):
                 chunk = bytes(entropy_accumulator[:chunk_target])
                 del entropy_accumulator[:chunk_target]
 
-                udp_send(
-                    sock,
-                    {
-                        "type": "samples",
-                        **node_identity_payload(),
-                        "payload_b64": base64.b64encode(chunk).decode("ascii"),
-                        "raw_bytes": len(chunk),
-                        "timestamp": time.time(),
-                    },
-                )
+                send_sample_chunk(sock, chunk)
                 with stats_lock:
                     runtime_stats["sample_packets_sent"] += 1
                     runtime_stats["sample_bytes_sent"] += len(chunk)
