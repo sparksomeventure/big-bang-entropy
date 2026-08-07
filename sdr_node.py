@@ -238,6 +238,12 @@ AMATEUR_BAND_PRESETS_HZ = {
     "13cm": (2320000000, 2450000000),
     "hi": (1420000000, 1421000000),
     "oh": (1610000000, 1613000000),
+    # Universal Ku-band LNB downconverter windows (RF, not IF/tuner frequency)
+    # -- matches this file's own CONVERTER_LO_LOW_HZ/CONVERTER_LO_HIGH_HZ /
+    # CONVERTER_RF_HIGH_MIN_HZ/CONVERTER_RF_HIGH_MAX_HZ defaults, for
+    # CONVERTER_MODE=down nodes (e.g. satellite/dish entropy sources).
+    "ku-low": (9750000000, 11700000000),
+    "ku-high": (11700000000, 12750000000),
 }
 
 THEME_BG = "#020202"
