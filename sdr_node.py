@@ -8,6 +8,7 @@ import io
 import json
 import math
 import os
+import signal
 import socket
 import struct
 import threading
@@ -1222,10 +1223,14 @@ last_auto_tune_at = 0.0
 
 def run_frequency_scan(source, current_repeat_score: float):
     """Score every configured scan candidate against the current frequency's
-    repeat_score. With AUTO_TUNE_ENABLED, a candidate that keeps winning by
-    AUTO_TUNE_MARGIN for AUTO_TUNE_MIN_WINS consecutive calls (i.e. scan
-    cycles) becomes the new operating frequency -- the feedback loop the scan
-    exists for. Without it, this only produces a report for a human to act on."""
+    repeat_score. With AUTO_TUNE_ENABLED, a candidate whose band label keeps
+    winning by AUTO_TUNE_MARGIN for AUTO_TUNE_MIN_WINS consecutive calls (i.e.
+    scan cycles) becomes the new operating frequency -- the feedback loop the
+    scan exists for. Tracking by label rather than exact freq_hz absorbs
+    adjacent grid points (one SCAN_STEP_HZ apart) trading the "best" rank
+    cycle to cycle from measurement noise; the actual retune target is
+    whichever exact frequency won most recently within that label. Without
+    AUTO_TUNE_ENABLED, this only produces a report for a human to act on."""
     global FREQ, TUNER_FREQ_HZ, DISPLAY_FREQ_HZ, RADIO_FREQ_PLAN, last_auto_tune_at
 
     candidates = build_scan_candidates()
@@ -1260,26 +1265,36 @@ def run_frequency_scan(source, current_repeat_score: float):
 
     auto_tune_event = None
     with scan_state_lock:
+        # Keyed by band label, not exact freq_hz: adjacent grid points a
+        # single SCAN_STEP_HZ apart routinely trade the "best" rank cycle to
+        # cycle from measurement noise alone. Tracking by label lets a streak
+        # accumulate as long as the SAME general neighborhood keeps winning,
+        # and we retune to whichever exact frequency won most recently within
+        # it once the streak clears the bar.
         if best["repeat_score"] <= current_repeat_score - AUTO_TUNE_MARGIN:
-            scan_streak[best["freq_hz"]] = scan_streak.get(best["freq_hz"], 0) + 1
-            for stale_freq in [f for f in scan_streak if f != best["freq_hz"]]:
-                del scan_streak[stale_freq]
+            streak_entry = scan_streak.get(best["label"], {"wins": 0, "freq_hz": best["freq_hz"]})
+            streak_entry["wins"] += 1
+            streak_entry["freq_hz"] = best["freq_hz"]
+            scan_streak[best["label"]] = streak_entry
+            for stale_label in [k for k in scan_streak if k != best["label"]]:
+                del scan_streak[stale_label]
         else:
             scan_streak.clear()
 
-        streak = scan_streak.get(best["freq_hz"], 0)
+        streak = scan_streak.get(best["label"], {}).get("wins", 0)
         cooldown_elapsed = (time.time() - last_auto_tune_at) >= AUTO_TUNE_COOLDOWN_SEC
 
         if AUTO_TUNE_ENABLED and streak >= AUTO_TUNE_MIN_WINS and cooldown_elapsed:
             previous_freq = FREQ
-            new_plan = resolve_radio_frequencies(best["freq_hz"])
+            target_freq_hz = scan_streak[best["label"]]["freq_hz"]
+            new_plan = resolve_radio_frequencies(target_freq_hz)
             try:
                 with tuning_lock:
                     apply_tuner_frequency(source, new_plan["tuner_freq_hz"])
             except Exception as exc:
-                log(f"[!] AUTO-TUNE: failed to retune to {best['freq_hz']} Hz: {format_iio_error(exc)}")
+                log(f"[!] AUTO-TUNE: failed to retune to {target_freq_hz} Hz: {format_iio_error(exc)}")
             else:
-                FREQ = best["freq_hz"]
+                FREQ = target_freq_hz
                 TUNER_FREQ_HZ = new_plan["tuner_freq_hz"]
                 DISPLAY_FREQ_HZ = new_plan["display_freq_hz"]
                 RADIO_FREQ_PLAN = new_plan
@@ -1287,13 +1302,13 @@ def run_frequency_scan(source, current_repeat_score: float):
                 scan_streak.clear()
                 auto_tune_event = {
                     "previous_freq_hz": previous_freq,
-                    "new_freq_hz": best["freq_hz"],
+                    "new_freq_hz": target_freq_hz,
                     "label": best["label"],
                     "repeat_score": best["repeat_score"],
                 }
                 log(
                     f"[*] AUTO-TUNE: node {NODE_ID} switched from {previous_freq} Hz to "
-                    f"{best['freq_hz']} Hz ({best['label']}), repeat_score "
+                    f"{target_freq_hz} Hz ({best['label']}), repeat_score "
                     f"{best['repeat_score']:.4f} vs {current_repeat_score:.4f} on the old frequency."
                 )
 
@@ -1745,7 +1760,7 @@ def source_audit_worker():
                 # Wait for event or interval
                 triggered = audit_trigger_event.wait(timeout=max(1, SOURCE_AUDIT_INTERVAL_SEC))
             if triggered:
-                log("[*] Source audit triggered by status poller (STALE or WARN status).")
+                log("[*] Source audit triggered early (status poller STALE/WARN, or manual SIGUSR1).")
                 audit_trigger_event.clear()
 
             raw_iq, raw_iq_at = get_latest_raw_iq_snapshot()
@@ -2028,7 +2043,16 @@ def list_sdr_devices():
     return 1
 
 
+def handle_manual_scan_signal(signum, frame):
+    """SIGUSR1: run the source-audit/frequency-scan cycle right now instead of
+    waiting for SOURCE_AUDIT_INTERVAL_SEC. Trigger from the host with:
+    docker exec <container> kill -USR1 1"""
+    log("[*] Manual source audit / frequency scan triggered via SIGUSR1.")
+    audit_trigger_event.set()
+
+
 def run_sdr_node():
+    signal.signal(signal.SIGUSR1, handle_manual_scan_signal)
     log(
         f"[*] SDR node {NODE_ID} starting. Target: "
         f"{UDP_TARGET_HOST}:{UDP_TARGET_PORT}, Source type: {SDR_TYPE}, "
