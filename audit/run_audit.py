@@ -654,10 +654,14 @@ def render_html(report):
 
     source_audits = report.get("source_audits", [])
     source_audit_rows = ""
+    scan_rows = ""
     for item in source_audits:
         accepting = "yes" if item.get("accepting_samples", True) else "no"
+        freq_hz = item.get("freq_hz")
+        freq_label = f"{freq_hz / 1e6:.3f} MHz" if isinstance(freq_hz, (int, float)) else "?"
         source_audit_rows += (
             f'<tr><td>{html.escape(str(item.get("node","unknown")))}</td>'
+            f'<td>{html.escape(freq_label)}</td>'
             f'<td>{html.escape(str(item.get("status","?")))}</td>'
             f'<td>{html.escape(str(item.get("repeat_score","?")))}</td>'
             f'<td>{html.escape(str(item.get("spectral_flatness","?")))}</td>'
@@ -665,8 +669,50 @@ def render_html(report):
             f'<td>{html.escape(str(item.get("consecutive_equal_ratio","?")))}</td>'
             f'<td>{html.escape(accepting)}</td></tr>'
         )
+
+        scan = item.get("scan") or {}
+        best = scan.get("best")
+        if best:
+            best_freq = best.get("freq_hz")
+            best_freq_label = f"{best_freq / 1e6:.3f} MHz" if isinstance(best_freq, (int, float)) else "?"
+            beats_current = (
+                isinstance(best.get("repeat_score"), (int, float))
+                and isinstance(item.get("repeat_score"), (int, float))
+                and best["repeat_score"] < item["repeat_score"]
+            )
+            note = "better than current" if beats_current else "current still best"
+            scan_rows += (
+                f'<tr><td>{html.escape(str(item.get("node","unknown")))}</td>'
+                f'<td>{len(scan.get("candidates", []))}</td>'
+                f'<td>{html.escape(best_freq_label)}</td>'
+                f'<td>{html.escape(str(best.get("label","?")))}</td>'
+                f'<td>{html.escape(str(best.get("repeat_score","?")))}</td>'
+                f'<td>{html.escape(note)}</td></tr>'
+            )
     if not source_audit_rows:
-        source_audit_rows = '<tr><td colspan="7">No source audit data</td></tr>'
+        source_audit_rows = '<tr><td colspan="8">No source audit data</td></tr>'
+    if not scan_rows:
+        scan_rows = '<tr><td colspan="6">No frequency scan data (set SCAN_BANDS on a node to enable it)</td></tr>'
+
+    auto_tune_log = report.get("auto_tune_log", [])
+    auto_tune_rows = ""
+    for entry in sorted(auto_tune_log, key=lambda e: e.get("at", 0), reverse=True)[:50]:
+        at = entry.get("at")
+        at_label = datetime.fromtimestamp(at, tz=timezone.utc).isoformat() if at else "?"
+        prev_hz = entry.get("previous_freq_hz")
+        new_hz = entry.get("new_freq_hz")
+        prev_label = f"{prev_hz / 1e6:.3f} MHz" if isinstance(prev_hz, (int, float)) else "?"
+        new_label = f"{new_hz / 1e6:.3f} MHz" if isinstance(new_hz, (int, float)) else "?"
+        auto_tune_rows += (
+            f'<tr><td>{html.escape(at_label)}</td>'
+            f'<td>{html.escape(str(entry.get("node","unknown")))}</td>'
+            f'<td>{html.escape(prev_label)}</td>'
+            f'<td>{html.escape(new_label)}</td>'
+            f'<td>{html.escape(str(entry.get("label","?")))}</td>'
+            f'<td>{html.escape(str(entry.get("repeat_score","?")))}</td></tr>'
+        )
+    if not auto_tune_rows:
+        auto_tune_rows = '<tr><td colspan="6">No auto-tune switches recorded</td></tr>'
 
     # premix stats
     pm = report.get("premix_stats")
@@ -808,8 +854,22 @@ def render_html(report):
 
   <h2>Latest source audits — raw/input <span class="stage-badge">SDR</span></h2>
   <table>
-    <thead><tr><th>Node ID</th><th>Status</th><th>Repeat score</th><th>Spectral flatness</th><th>Dominant value ratio</th><th>Consecutive equal ratio</th><th>Accepting samples</th></tr></thead>
+    <thead><tr><th>Node ID</th><th>Frequency</th><th>Status</th><th>Repeat score</th><th>Spectral flatness</th><th>Dominant value ratio</th><th>Consecutive equal ratio</th><th>Accepting samples</th></tr></thead>
     <tbody>{source_audit_rows}</tbody>
+  </table>
+
+  <h2>Frequency scan — side/harmonic bands <span class="stage-badge">SDR</span></h2>
+  <p class="muted">Best candidate found on each node's last scan cycle (SCAN_BANDS). Lower repeat score is better.</p>
+  <table>
+    <thead><tr><th>Node ID</th><th>Candidates scanned</th><th>Best frequency</th><th>Label</th><th>Repeat score</th><th>Verdict</th></tr></thead>
+    <tbody>{scan_rows}</tbody>
+  </table>
+
+  <h2>Auto-tune log</h2>
+  <p class="muted">Frequency switches the feedback loop made on its own (AUTO_TUNE_ENABLED), most recent first.</p>
+  <table>
+    <thead><tr><th>Time (UTC)</th><th>Node ID</th><th>Previous frequency</th><th>New frequency</th><th>Label</th><th>Repeat score</th></tr></thead>
+    <tbody>{auto_tune_rows}</tbody>
   </table>
 
   <h2>Generator parameters</h2>
@@ -873,6 +933,11 @@ def main():
         source_audits = http_json(f"{TARGET_HTTP_URL}/source-audits")
     except Exception as e:
         alerts_early.append(f"Could not fetch /source-audits: {e}")
+    auto_tune_log = []
+    try:
+        auto_tune_log = http_json(f"{TARGET_HTTP_URL}/auto-tune-log")
+    except Exception as e:
+        alerts_early.append(f"Could not fetch /auto-tune-log: {e}")
 
     node_health = evaluate_nodes(sources_raw)
     if len(node_health) == 1:
@@ -1011,6 +1076,7 @@ def main():
         "entropy_assessment": entropy_assessment,
         "node_health": node_health,
         "source_audits": source_audits,
+        "auto_tune_log": auto_tune_log,
         "healthz": healthz,
         "sources": sources_raw,
         "environment": sys_snapshot(),

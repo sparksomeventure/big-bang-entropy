@@ -869,6 +869,8 @@ def _persist_source_audits():
                     for node_name, state in sorted(source_audits.items())
                 },
             }
+        with auto_tune_log_lock:
+            snapshot["auto_tune_log"] = list(auto_tune_log)
         SOURCE_AUDIT_STATE_PATH.write_text(
             json.dumps(snapshot, indent=2, ensure_ascii=False),
             encoding="utf-8",
@@ -912,6 +914,24 @@ def _update_source_audit(node_name: str, audit_payload: Dict[str, object]):
     with source_audits_lock:
         source_audits[node_name] = audit_payload
     _persist_source_audits()
+
+
+AUTO_TUNE_LOG_MAX_ENTRIES = max(1, int(os.getenv("AUTO_TUNE_LOG_MAX_ENTRIES", "200")))
+auto_tune_log: list = []
+auto_tune_log_lock = threading.Lock()
+
+
+def _record_auto_tune_event(node_name: str, event: Dict[str, object], at: float):
+    entry = {"node": node_name, "at": at, **event}
+    with auto_tune_log_lock:
+        auto_tune_log.append(entry)
+        if len(auto_tune_log) > AUTO_TUNE_LOG_MAX_ENTRIES:
+            del auto_tune_log[: len(auto_tune_log) - AUTO_TUNE_LOG_MAX_ENTRIES]
+    log(
+        f"[*] AUTO-TUNE event recorded for node={node_name}: "
+        f"{event.get('previous_freq_hz')} Hz -> {event.get('new_freq_hz')} Hz "
+        f"({event.get('label')}, repeat_score={event.get('repeat_score')})"
+    )
 
 
 def _node_accepts_samples(node_name: str) -> bool:
@@ -1539,7 +1559,22 @@ def _handle_source_audit(message: dict):
     audit_payload["status"] = summary["status"]
     audit_payload["accepting_samples"] = summary["accepting_samples"]
     audit_payload["repeat_score_threshold"] = SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD
+
+    scan = message.get("scan")
+    auto_tune_event = None
+    if isinstance(scan, dict):
+        candidates = scan.get("candidates")
+        best = scan.get("best")
+        audit_payload["scan"] = {
+            "candidates": candidates if isinstance(candidates, list) else [],
+            "best": best if isinstance(best, dict) else None,
+        }
+        if isinstance(scan.get("auto_tune_event"), dict):
+            auto_tune_event = scan["auto_tune_event"]
+
     _update_source_audit(node_name, audit_payload)
+    if auto_tune_event is not None:
+        _record_auto_tune_event(node_name, auto_tune_event, updated_at)
     _record_node_metric(
         node_name,
         timestamp=updated_at,
@@ -2360,6 +2395,12 @@ def list_source_audits():
             item["age_sec"] = round(now - state["updated_at"], 1) if state.get("updated_at") else None
             payload.append(item)
     return jsonify(payload)
+
+
+@app.route("/auto-tune-log")
+def get_auto_tune_log():
+    with auto_tune_log_lock:
+        return jsonify(list(auto_tune_log))
 
 
 def _is_trusted_http_client() -> bool:

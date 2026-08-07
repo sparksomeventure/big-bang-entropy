@@ -65,7 +65,7 @@ WATERFALL_INTERVAL_SEC = int(os.getenv("WATERFALL_INTERVAL_SEC", "10"))
 WATERFALL_UDP_CHUNK_BYTES = int(os.getenv("WATERFALL_UDP_CHUNK_BYTES", "48000"))
 WATERFALL_HISTORY_FRAMES = int(os.getenv("WATERFALL_HISTORY_FRAMES", "5"))
 WATERFALL_AXIS_WINDOW_SEC = int(os.getenv("WATERFALL_AXIS_WINDOW_SEC", "30"))
-SOURCE_AUDIT_INTERVAL_SEC = int(os.getenv("SOURCE_AUDIT_INTERVAL_SEC", str(24 * 60 * 60)))
+SOURCE_AUDIT_INTERVAL_SEC = int(os.getenv("SOURCE_AUDIT_INTERVAL_SEC", str(3 * 60 * 60)))
 SOURCE_AUDIT_SAMPLE_BYTES = int(os.getenv("SOURCE_AUDIT_SAMPLE_BYTES", str(256 * 1024)))
 NODE_METRICS_INTERVAL_SEC = int(os.getenv("NODE_METRICS_INTERVAL_SEC", "30"))
 LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
@@ -119,6 +119,26 @@ waterfall_axis_metrics = deque(maxlen=axis_window_frames)
 MAX_SHARED_RAW_IQ_AGE_SEC = max(10, WATERFALL_INTERVAL_SEC * 3)
 MAX_SAFE_SAMPLE_PACKET_BYTES = 48000
 
+# tuning_lock guards every hardware retune/read so the frequency scanner can
+# briefly steal the tuner from entropy_sender_worker without the two threads
+# racing on the same device handle. active_sdr_source always points at the
+# SDRSourceHandle entropy_sender_worker currently reads from, including after
+# a reconnect, so other threads never operate on a stale/closed handle.
+tuning_lock = threading.Lock()
+active_sdr_source_lock = threading.Lock()
+active_sdr_source = None
+
+
+def set_active_sdr_source(source):
+    global active_sdr_source
+    with active_sdr_source_lock:
+        active_sdr_source = source
+
+
+def get_active_sdr_source():
+    with active_sdr_source_lock:
+        return active_sdr_source
+
 
 def node_identity_payload():
     payload = {
@@ -170,6 +190,54 @@ CONVERTER_RF_LOW_MIN_HZ = int(os.getenv("CONVERTER_RF_LOW_MIN_HZ", "10700000000"
 CONVERTER_RF_LOW_MAX_HZ = int(os.getenv("CONVERTER_RF_LOW_MAX_HZ", "11700000000"))
 CONVERTER_RF_HIGH_MIN_HZ = int(os.getenv("CONVERTER_RF_HIGH_MIN_HZ", "11700000000"))
 CONVERTER_RF_HIGH_MAX_HZ = int(os.getenv("CONVERTER_RF_HIGH_MAX_HZ", "12750000000"))
+
+# Side/harmonic frequency scanning: on every source-audit cycle, if SCAN_BANDS
+# is set, the node briefly retunes across a bounded set of candidate
+# frequencies (grid points inside the named bands, plus harmonics of FREQ
+# that land inside them) and scores each one the same way as the main source
+# audit. See build_scan_candidates().
+SCAN_BANDS = os.getenv("SCAN_BANDS", "").strip()
+SCAN_STEP_HZ = int(os.getenv("SCAN_STEP_HZ", "250000"))
+SCAN_MAX_CANDIDATES = max(1, int(os.getenv("SCAN_MAX_CANDIDATES", "8")))
+SCAN_HARMONIC_MULTIPLES = os.getenv("SCAN_HARMONIC_MULTIPLES", "2,3")
+SCAN_SAMPLE_BYTES = int(os.getenv("SCAN_SAMPLE_BYTES", "65536"))
+SCAN_SETTLE_SEC = float(os.getenv("SCAN_SETTLE_SEC", "0.1"))
+SCAN_GUARD_HZ = int(os.getenv("SCAN_GUARD_HZ", str(int(SAMPLE_RATE))))
+
+# Feedback loop: if a scanned candidate keeps beating the current frequency's
+# entropy quality by AUTO_TUNE_MARGIN for AUTO_TUNE_MIN_WINS consecutive scan
+# cycles, the node retunes itself to that frequency. Off by default -- opt in
+# per node once you trust the antenna/band setup.
+AUTO_TUNE_ENABLED = os.getenv("AUTO_TUNE_ENABLED", "1").lower() in ("1", "true", "yes")
+AUTO_TUNE_MARGIN = float(os.getenv("AUTO_TUNE_MARGIN", "0.05"))
+AUTO_TUNE_MIN_WINS = max(1, int(os.getenv("AUTO_TUNE_MIN_WINS", "3")))
+AUTO_TUNE_COOLDOWN_SEC = int(os.getenv("AUTO_TUNE_COOLDOWN_SEC", str(6 * 60 * 60)))
+
+# Coarse IARU Region 1 (EU/Africa) amateur allocations, Hz. This is a scan-grid
+# convenience, not a bandplan authority -- adjust/override via SCAN_BANDS to
+# match your region and the antenna actually connected to each node.
+AMATEUR_BAND_PRESETS_HZ = {
+    "2200m": (135700, 137800),
+    "630m": (472000, 479000),
+    "160m": (1810000, 2000000),
+    "80m": (3500000, 3800000),
+    "60m": (5351500, 5366500),
+    "40m": (7000000, 7200000),
+    "30m": (10100000, 10150000),
+    "20m": (14000000, 14350000),
+    "17m": (18068000, 18168000),
+    "15m": (21000000, 21450000),
+    "12m": (24890000, 24990000),
+    "10m": (28000000, 29700000),
+    "6m": (50000000, 52000000),
+    "4m": (70000000, 70500000),
+    "2m": (144000000, 146000000),
+    "70cm": (430000000, 440000000),
+    "23cm": (1240000000, 1300000000),
+    "13cm": (2320000000, 2450000000),
+    "hi": (1420000000, 1421000000),
+    "oh": (1610000000, 1613000000),
+}
 
 THEME_BG = "#020202"
 THEME_PRIMARY = "#05B6D4"
@@ -569,9 +637,9 @@ def get_display_frequency_axis():
     return 1_000_000.0, "MHz"
 
 
-def resolve_radio_frequencies():
+def resolve_radio_frequencies(rf_freq_hz=None):
     mode = CONVERTER_MODE or "none"
-    rf_freq_hz = FREQ
+    rf_freq_hz = FREQ if rf_freq_hz is None else int(rf_freq_hz)
 
     if mode == "none":
         return {
@@ -960,6 +1028,271 @@ def reconnect_sdr_source(previous_source, reason):
     os._exit(1)
 
 
+def parse_comma_list(value: str):
+    return [item.strip().lower() for item in value.split(",") if item.strip()]
+
+
+def parse_int_list(value: str):
+    result = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            result.append(int(item))
+        except ValueError:
+            log(f"[!] Ignoring non-integer entry {item!r} in harmonic multiples list.")
+    return result
+
+
+def rf_frequency_reachable(rf_freq_hz: int) -> bool:
+    """True if rf_freq_hz is reachable through the node's configured
+    CONVERTER_MODE, without raising. Mirrors resolve_radio_frequencies()'s own
+    validation (which raises, since that path is for the primary FREQ and
+    should fail loudly at startup) so the scanner can silently skip a
+    candidate the up/down converter simply cannot reach -- e.g. a VHF/UHF
+    amateur-band candidate on a node wired to a Ku-band LNB downconverter,
+    or vice versa -- instead of wasting a retune attempt on it."""
+    if rf_freq_hz <= 0:
+        return False
+    mode = CONVERTER_MODE or "none"
+    if mode == "none":
+        return True
+    if mode == "up":
+        return CONVERTER_LO_HZ is not None and CONVERTER_LO_HZ > 0
+    if mode == "down":
+        if CONVERTER_LO_HZ is not None:
+            return rf_freq_hz != CONVERTER_LO_HZ
+        return (
+            CONVERTER_RF_LOW_MIN_HZ <= rf_freq_hz < CONVERTER_RF_LOW_MAX_HZ
+            or CONVERTER_RF_HIGH_MIN_HZ <= rf_freq_hz <= CONVERTER_RF_HIGH_MAX_HZ
+        )
+    return False
+
+
+_scan_range_warning_logged = False
+
+
+def build_scan_candidates(rf_freq_hz=None):
+    """Candidate (freq_hz, label) pairs for the periodic side/harmonic scan:
+    a bounded grid across each SCAN_BANDS preset, plus harmonics of the
+    current operating frequency that happen to land inside one of those
+    bands. Every candidate is checked against rf_frequency_reachable() first,
+    so e.g. VHF/UHF ham-band presets are silently skipped on a node whose
+    CONVERTER_MODE only reaches a Ku-band downconverter window, rather than
+    wasting a retune attempt outside what the hardware can actually tune to.
+    Closest-to-current candidates are kept first, capped at
+    SCAN_MAX_CANDIDATES so a single scan cycle stays short."""
+    global _scan_range_warning_logged
+    rf_freq_hz = FREQ if rf_freq_hz is None else int(rf_freq_hz)
+    band_names = parse_comma_list(SCAN_BANDS)
+    if not band_names:
+        return []
+
+    bands = []
+    for name in band_names:
+        preset = AMATEUR_BAND_PRESETS_HZ.get(name)
+        if preset is None:
+            log(
+                f"[!] SCAN_BANDS: unknown band preset {name!r}, skipping. "
+                f"Known presets: {', '.join(sorted(AMATEUR_BAND_PRESETS_HZ))}"
+            )
+            continue
+        bands.append((name, preset[0], preset[1]))
+    if not bands:
+        return []
+
+    guard_hz = max(1, SCAN_GUARD_HZ)
+    candidates = {}
+    range_rejected = False
+
+    def add_candidate(freq_hz, label):
+        nonlocal range_rejected
+        freq_hz = int(freq_hz)
+        if freq_hz <= 0 or abs(freq_hz - rf_freq_hz) < guard_hz:
+            return
+        if not any(lo <= freq_hz <= hi for _, lo, hi in bands):
+            return
+        if not rf_frequency_reachable(freq_hz):
+            range_rejected = True
+            return
+        candidates.setdefault(freq_hz, label)
+
+    for multiple in parse_int_list(SCAN_HARMONIC_MULTIPLES):
+        if multiple >= 2:
+            add_candidate(rf_freq_hz * multiple, f"{multiple}x harmonic")
+
+    step_hz = max(1, SCAN_STEP_HZ)
+    for name, lo, hi in bands:
+        freq = lo
+        while freq <= hi:
+            add_candidate(freq, f"{name} band")
+            freq += step_hz
+
+    if not candidates and range_rejected and not _scan_range_warning_logged:
+        _scan_range_warning_logged = True
+        log(
+            f"[!] SCAN_BANDS={SCAN_BANDS!r} produced no candidates reachable under "
+            f"CONVERTER_MODE={CONVERTER_MODE!r}. Check CONVERTER_RF_*_HZ / CONVERTER_LO_HZ "
+            "against the bands you configured -- they're on different converter windows."
+        )
+
+    ordered = sorted(candidates.items(), key=lambda item: abs(item[0] - rf_freq_hz))
+    return ordered[:SCAN_MAX_CANDIDATES]
+
+
+def apply_tuner_frequency(source, tuner_freq_hz: int):
+    """Retune the live SDR source. Caller must hold tuning_lock."""
+    tuner_freq_hz = int(tuner_freq_hz)
+    if SDR_TYPE == "rtlsdr":
+        source.source.center_freq = tuner_freq_hz
+        source.source.reset_buffer()
+    elif SDR_TYPE == "pluto":
+        phy = source.ctx.find_device("ad9361-phy")
+        if phy is None:
+            raise PlutoInitError("IIO device ad9361-phy not found while retuning")
+        lo = phy.find_channel("altvoltage0", True)
+        if lo is None:
+            raise PlutoInitError("IIO output channel altvoltage0 not found while retuning")
+        lo.attrs["frequency"].value = str(tuner_freq_hz)
+    elif SDR_TYPE == "dummy":
+        source.source.signal_hz = float(tuner_freq_hz)
+    else:
+        raise RuntimeError(f"Retuning not supported for SDR_TYPE={SDR_TYPE}")
+
+
+def read_scan_chunk(source, num_bytes):
+    if SDR_TYPE == "rtlsdr":
+        return source.source.read_bytes(num_bytes)
+    if SDR_TYPE == "dummy":
+        return source.source.read()
+    source.source.refill()
+    return source.source.read()
+
+
+def capture_frequency_score(source, rf_freq_hz: int, sample_bytes: int):
+    """Briefly retune to rf_freq_hz, capture a short sample, score it the same
+    way as the periodic source audit, then retune back to the node's current
+    operating frequency. Blocks entropy_sender_worker for the duration via
+    tuning_lock, so keep sample_bytes modest."""
+    original_tuner_hz = TUNER_FREQ_HZ
+    candidate_tuner_hz = resolve_radio_frequencies(rf_freq_hz)["tuner_freq_hz"]
+
+    with tuning_lock:
+        try:
+            apply_tuner_frequency(source, candidate_tuner_hz)
+            if SCAN_SETTLE_SEC > 0:
+                time.sleep(SCAN_SETTLE_SEC)
+            # Discard one read after retuning: the driver/DMA buffer can still
+            # hold samples captured at the previous frequency.
+            read_scan_chunk(source, sample_bytes)
+            raw = read_scan_chunk(source, sample_bytes)
+        finally:
+            # Best-effort restore, but never let a failure here pass silently:
+            # entropy_sender_worker resumes reading right after this lock is
+            # released, and if we're still parked on the candidate frequency
+            # it would keep streaming samples mislabeled as the operating
+            # frequency without anyone noticing.
+            try:
+                apply_tuner_frequency(source, original_tuner_hz)
+            except Exception as restore_exc:
+                log(
+                    f"[!] AUTO-TUNE/scan: FAILED to retune node {NODE_ID} back to "
+                    f"{original_tuner_hz} Hz after probing {rf_freq_hz} Hz: "
+                    f"{format_iio_error(restore_exc)}. Forcing SDR reconnect to recover."
+                )
+                set_active_sdr_source(reconnect_sdr_source(source, str(restore_exc)))
+            if SCAN_SETTLE_SEC > 0:
+                time.sleep(SCAN_SETTLE_SEC)
+
+    return analyze_raw_signal(raw)
+
+
+scan_state_lock = threading.Lock()
+scan_streak = {}
+last_auto_tune_at = 0.0
+
+
+def run_frequency_scan(source, current_repeat_score: float):
+    """Score every configured scan candidate against the current frequency's
+    repeat_score. With AUTO_TUNE_ENABLED, a candidate that keeps winning by
+    AUTO_TUNE_MARGIN for AUTO_TUNE_MIN_WINS consecutive calls (i.e. scan
+    cycles) becomes the new operating frequency -- the feedback loop the scan
+    exists for. Without it, this only produces a report for a human to act on."""
+    global FREQ, TUNER_FREQ_HZ, DISPLAY_FREQ_HZ, RADIO_FREQ_PLAN, last_auto_tune_at
+
+    candidates = build_scan_candidates()
+    if not candidates or source is None:
+        return None
+
+    results = []
+    for freq_hz, label in candidates:
+        try:
+            metrics = capture_frequency_score(source, freq_hz, SCAN_SAMPLE_BYTES)
+        except Exception as exc:
+            log(f"[!] Frequency scan of {freq_hz} Hz ({label}) failed: {format_iio_error(exc)}")
+            continue
+        if metrics is None:
+            continue
+        results.append(
+            {
+                "freq_hz": freq_hz,
+                "label": label,
+                "repeat_score": metrics["repeat_score"],
+                "spectral_flatness": metrics["spectral_flatness"],
+                "dominant_value_ratio": metrics["dominant_value_ratio"],
+                "sample_count": metrics["sample_count"],
+            }
+        )
+
+    if not results:
+        return None
+
+    results.sort(key=lambda item: item["repeat_score"])
+    best = results[0]
+
+    auto_tune_event = None
+    with scan_state_lock:
+        if best["repeat_score"] <= current_repeat_score - AUTO_TUNE_MARGIN:
+            scan_streak[best["freq_hz"]] = scan_streak.get(best["freq_hz"], 0) + 1
+            for stale_freq in [f for f in scan_streak if f != best["freq_hz"]]:
+                del scan_streak[stale_freq]
+        else:
+            scan_streak.clear()
+
+        streak = scan_streak.get(best["freq_hz"], 0)
+        cooldown_elapsed = (time.time() - last_auto_tune_at) >= AUTO_TUNE_COOLDOWN_SEC
+
+        if AUTO_TUNE_ENABLED and streak >= AUTO_TUNE_MIN_WINS and cooldown_elapsed:
+            previous_freq = FREQ
+            new_plan = resolve_radio_frequencies(best["freq_hz"])
+            try:
+                with tuning_lock:
+                    apply_tuner_frequency(source, new_plan["tuner_freq_hz"])
+            except Exception as exc:
+                log(f"[!] AUTO-TUNE: failed to retune to {best['freq_hz']} Hz: {format_iio_error(exc)}")
+            else:
+                FREQ = best["freq_hz"]
+                TUNER_FREQ_HZ = new_plan["tuner_freq_hz"]
+                DISPLAY_FREQ_HZ = new_plan["display_freq_hz"]
+                RADIO_FREQ_PLAN = new_plan
+                last_auto_tune_at = time.time()
+                scan_streak.clear()
+                auto_tune_event = {
+                    "previous_freq_hz": previous_freq,
+                    "new_freq_hz": best["freq_hz"],
+                    "label": best["label"],
+                    "repeat_score": best["repeat_score"],
+                }
+                log(
+                    f"[*] AUTO-TUNE: node {NODE_ID} switched from {previous_freq} Hz to "
+                    f"{best['freq_hz']} Hz ({best['label']}), repeat_score "
+                    f"{best['repeat_score']:.4f} vs {current_repeat_score:.4f} on the old frequency."
+                )
+
+    return {"candidates": results, "best": best, "auto_tune_event": auto_tune_event}
+
+
 def entropy_sender_worker(source):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     entropy_accumulator = bytearray()
@@ -971,27 +1304,33 @@ def entropy_sender_worker(source):
     )
 
     pluto_read_logged = False
+    set_active_sdr_source(source)
     while True:
         read_stage = "idle"
         try:
-            if SDR_TYPE == "rtlsdr":
-                # read_bytes(n) returns bytes/bytearray for RTL-SDR
-                read_stage = "rtlsdr_read_sync"
-                raw_data = source.source.read_bytes(RTL_READ_BYTES)
-            elif SDR_TYPE == "dummy":
-                read_stage = "dummy_read"
-                raw_data = source.source.read()
-                if DUMMY_READ_SLEEP_SEC > 0:
-                    time.sleep(DUMMY_READ_SLEEP_SEC)
-            else:
-                # buffer.refill() for PlutoSDR
-                if not pluto_read_logged:
-                    log("[*] Pluto stream: refill/read RX buffer")
-                    pluto_read_logged = True
-                read_stage = "pluto_buffer_refill"
-                source.source.refill()
-                read_stage = "pluto_buffer_read"
-                raw_data = source.source.read()
+            # Held only around the read itself so the frequency scanner (see
+            # capture_frequency_score) can pause us, retune elsewhere, and
+            # hand the tuner back without either side reading the wrong band.
+            with tuning_lock:
+                if SDR_TYPE == "rtlsdr":
+                    # read_bytes(n) returns bytes/bytearray for RTL-SDR
+                    read_stage = "rtlsdr_read_sync"
+                    raw_data = source.source.read_bytes(RTL_READ_BYTES)
+                elif SDR_TYPE == "dummy":
+                    read_stage = "dummy_read"
+                    raw_data = source.source.read()
+                else:
+                    # buffer.refill() for PlutoSDR
+                    if not pluto_read_logged:
+                        log("[*] Pluto stream: refill/read RX buffer")
+                        pluto_read_logged = True
+                    read_stage = "pluto_buffer_refill"
+                    source.source.refill()
+                    read_stage = "pluto_buffer_read"
+                    raw_data = source.source.read()
+
+            if SDR_TYPE == "dummy" and DUMMY_READ_SLEEP_SEC > 0:
+                time.sleep(DUMMY_READ_SLEEP_SEC)
 
             update_latest_raw_iq(raw_data)
             update_latest_signal_metrics(raw_data)
@@ -1066,6 +1405,7 @@ def entropy_sender_worker(source):
             log(f"[!] SDR streaming error during {read_stage}: {format_iio_error(exc)}")
             entropy_accumulator.clear()
             source = reconnect_sdr_source(source, str(exc))
+            set_active_sdr_source(source)
             pluto_read_logged = False
             time.sleep(1)
 
@@ -1381,9 +1721,11 @@ def waterfall_sender_worker():
 
 def source_audit_worker():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    scan_bands_active = bool(parse_comma_list(SCAN_BANDS))
     log(
         f"[*] Source audit worker ready (node={NODE_ID}, interval={SOURCE_AUDIT_INTERVAL_SEC}s, "
-        f"sample_bytes~={SOURCE_AUDIT_SAMPLE_BYTES}, source=shared_raw_iq)"
+        f"sample_bytes~={SOURCE_AUDIT_SAMPLE_BYTES}, source=shared_raw_iq, "
+        f"scan_bands={SCAN_BANDS or '-'}, auto_tune={'on' if AUTO_TUNE_ENABLED else 'off'})"
     )
 
     first_run = True
@@ -1408,15 +1750,27 @@ def source_audit_worker():
                 time.sleep(5)
                 continue
 
-            udp_send(
-                sock,
-                {
-                    "type": "source_audit",
-                    **node_identity_payload(),
-                    "timestamp": raw_iq_at or time.time(),
-                    "metrics": metrics,
-                },
-            )
+            audit_message = {
+                "type": "source_audit",
+                **node_identity_payload(),
+                "timestamp": raw_iq_at or time.time(),
+                "metrics": metrics,
+            }
+
+            scan_outcome = None
+            if scan_bands_active:
+                try:
+                    scan_outcome = run_frequency_scan(get_active_sdr_source(), metrics["repeat_score"])
+                except Exception as exc:
+                    log(f"[!] Frequency scan error: {format_iio_error(exc)}")
+                if scan_outcome:
+                    audit_message["scan"] = {
+                        "candidates": scan_outcome["candidates"],
+                        "best": scan_outcome["best"],
+                        "auto_tune_event": scan_outcome["auto_tune_event"],
+                    }
+
+            udp_send(sock, audit_message)
             with stats_lock:
                 runtime_stats["source_audits_sent"] += 1
                 runtime_stats["last_source_audit_at"] = time.time()
@@ -1425,6 +1779,12 @@ def source_audit_worker():
                 f"[*] Source audit sent (node={NODE_ID}, repeat_score={metrics['repeat_score']}, "
                 f"spectral_flatness={metrics['spectral_flatness']})"
             )
+            if scan_outcome:
+                log(
+                    f"[*] Frequency scan: {len(scan_outcome['candidates'])} candidate(s), "
+                    f"best={scan_outcome['best']['freq_hz']} Hz "
+                    f"({scan_outcome['best']['label']}, repeat_score={scan_outcome['best']['repeat_score']:.4f})"
+                )
         except Exception as exc:
             log(f"[!] Source audit error: {exc}")
             time.sleep(5)
@@ -1708,6 +2068,7 @@ def run_sdr_node():
         os._exit(1)
 
     # Start workers - pass the initialized source to the sampler thread
+    set_active_sdr_source(sdr_source)
     threading.Thread(target=entropy_sender_worker, args=(sdr_source,), daemon=True).start()
     threading.Thread(target=waterfall_sender_worker, daemon=True).start()
     threading.Thread(target=source_audit_worker, daemon=True).start()
