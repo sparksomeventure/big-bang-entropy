@@ -92,6 +92,14 @@ SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD = float(
 SOURCE_AUDIT_MAX_AGE_SEC = int(
     os.getenv("SOURCE_AUDIT_MAX_AGE_SEC", str(36 * 60 * 60))
 )
+# A node can pass the raw-signal audit (repeat_score under threshold) while
+# still producing zero actual entropy packets -- e.g. a dead antenna feeding
+# a flat DC-ish signal that happens not to look "repetitive". That's not
+# healthy just because the audit says so, so once a node has been around for
+# at least this long, if it has never sent a sample packet (or hasn't sent
+# one in this long), its status is overridden to NO_THROUGHPUT and it's
+# treated as not accepting_samples -- see _no_throughput_override().
+NO_THROUGHPUT_GRACE_SEC = int(os.getenv("NO_THROUGHPUT_GRACE_SEC", "120"))
 MIX_BLOCK_BYTES = int(os.getenv("MIX_BLOCK_BYTES", "64"))
 LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
 LOW_POOL_THRESHOLD_PCT = float(os.getenv("LOW_POOL_THRESHOLD_PCT", "10"))
@@ -910,6 +918,34 @@ def _source_audit_summary(audit: Optional[Dict[str, object]], now: Optional[floa
     }
 
 
+def _no_throughput_override(
+    node_stats_state: Optional[Dict[str, object]],
+    accepting_samples: bool,
+    now: Optional[float] = None,
+):
+    """A node can pass the raw-signal audit while producing zero actual
+    entropy packets -- e.g. a dead antenna feeding a flat, low-variance
+    signal that doesn't happen to look "repetitive" to repeat_score. Once a
+    node has been around for at least NO_THROUGHPUT_GRACE_SEC, if it has
+    never sent a sample packet (or hasn't sent one in that long), report it
+    as NO_THROUGHPUT / not accepting instead of taking the audit's word for
+    it. Returns (status_override_or_None, accepting_samples, sample_age_sec)."""
+    now = time.time() if now is None else now
+    if not accepting_samples or not node_stats_state:
+        return None, accepting_samples, None
+
+    first_seen = node_stats_state.get("first_seen") or 0.0
+    active_for = max(now - first_seen, 0.0) if first_seen else 0.0
+    last_sample_at = node_stats_state.get("last_sample_at") or 0.0
+    sample_age_sec = round(now - last_sample_at, 1) if last_sample_at else None
+
+    if active_for < NO_THROUGHPUT_GRACE_SEC:
+        return None, accepting_samples, sample_age_sec
+    if last_sample_at == 0.0 or (sample_age_sec is not None and sample_age_sec >= NO_THROUGHPUT_GRACE_SEC):
+        return "NO_THROUGHPUT", False, sample_age_sec
+    return None, accepting_samples, sample_age_sec
+
+
 def _update_source_audit(node_name: str, audit_payload: Dict[str, object]):
     with source_audits_lock:
         source_audits[node_name] = audit_payload
@@ -1143,6 +1179,7 @@ def _update_node_stats(node_name: str, raw_bytes: int, payload_bytes: int, rejec
                 "rejected_packets": 0,
                 "rejected_bytes": 0,
                 "last_seen": 0.0,
+                "last_sample_at": 0.0,
             },
         )
         if rejected:
@@ -1152,6 +1189,10 @@ def _update_node_stats(node_name: str, raw_bytes: int, payload_bytes: int, rejec
             state["raw_bytes"] += raw_bytes
             state["payload_bytes"] += payload_bytes
             state["packets"] += 1
+            # Only successfully-accepted packets count as real throughput --
+            # see _no_throughput_override(). Rejected ones already show up
+            # via rejected_packets/health_rejected_packets elsewhere.
+            state["last_sample_at"] = time.time()
         state["last_seen"] = time.time()
     if rejected:
         _record_node_metric(
@@ -1179,6 +1220,7 @@ def _touch_node_stats(node_name: str):
                 "rejected_packets": 0,
                 "rejected_bytes": 0,
                 "last_seen": 0.0,
+                "last_sample_at": 0.0,
             },
         )
         state["last_seen"] = time.time()
@@ -1251,6 +1293,10 @@ def _snapshot_sources():
             active_for = max(now - state["first_seen"], 1.0)
             audit_info = audit_snapshot.get(node_name)
             audit_summary = _source_audit_summary(audit_info, now=now)
+            no_throughput_status, accepting_samples, sample_age_sec = _no_throughput_override(
+                state, audit_summary["accepting_samples"], now=now
+            )
+            source_audit_status = no_throughput_status or audit_summary["status"]
             metadata = dict((runtime_snapshot.get(node_name) or {}).get("metadata") or {})
             if audit_info:
                 for key in NODE_METADATA_KEYS:
@@ -1270,10 +1316,11 @@ def _snapshot_sources():
                 if state["last_seen"]
                 else None,
                 "avg_bytes_per_sec": round(state["raw_bytes"] / active_for, 1),
-                "source_audit_status": audit_summary["status"],
+                "source_audit_status": source_audit_status,
                 "source_audit_repeat_score": audit_summary["repeat_score"],
                 "source_audit_age_sec": audit_summary["age_sec"],
-                "accepting_samples": audit_summary["accepting_samples"],
+                "accepting_samples": accepting_samples,
+                "sample_age_sec": sample_age_sec,
             }
             commit_state = commit_verification_snapshot.get(node_name)
             if commit_state:
@@ -2352,11 +2399,15 @@ def get_node_status(node_name: str):
         audit_info = source_audits.get(node_name)
         
     summary = _source_audit_summary(audit_info, now=now)
-    
+
     with node_stats_lock:
-        stats = node_stats.get(node_name, {})
+        stats = dict(node_stats.get(node_name, {}))
         last_seen = stats.get("last_seen", 0.0)
         rejected_packets = stats.get("rejected_packets", 0)
+    no_throughput_status, accepting_samples, sample_age_sec = _no_throughput_override(
+        stats, summary["accepting_samples"], now=now
+    )
+    status = no_throughput_status or summary["status"]
     with node_runtime_stats_lock:
         runtime = node_runtime_stats.get(node_name, {})
         metadata = dict(runtime.get("metadata") or {})
@@ -2368,13 +2419,14 @@ def get_node_status(node_name: str):
     return jsonify({
         "node": node_name,
         "metadata": metadata,
-        "status": summary["status"],
-        "accepting_samples": summary["accepting_samples"],
+        "status": status,
+        "accepting_samples": accepting_samples,
         "repeat_score": summary["repeat_score"],
         "repeat_score_threshold": SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD,
         "age_sec": summary["age_sec"],
         "max_age_sec": SOURCE_AUDIT_MAX_AGE_SEC,
         "last_seen_age_sec": round(now - last_seen, 1) if last_seen else None,
+        "sample_age_sec": sample_age_sec,
         "rejected_packets": rejected_packets
     })
 
