@@ -31,7 +31,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 PLUTO_IP = os.getenv("PLUTO_IP", "192.168.2.1")
-FREQ = int(os.getenv("FREQ", "1420405000"))
+# FREQ=auto: instead of a fixed Hz value, do a one-shot exhaustive sweep of
+# the device's tunable range at startup and operate on whatever scores best.
+# See AUTOSCAN_* below and run_full_spectrum_autoscan().
+_FREQ_RAW = os.getenv("FREQ", "1420405000").strip()
+AUTOSCAN_ON_START = _FREQ_RAW.lower() == "auto"
+FREQ = 0 if AUTOSCAN_ON_START else int(_FREQ_RAW)
 GAIN = int(os.getenv("GAIN", "70"))
 RX_CHANNEL = os.getenv("RX_CHANNEL", "voltage0")
 PLUTO_RX_CHANNEL_MODE = os.getenv("PLUTO_RX_CHANNEL_MODE", "iq").strip().lower()
@@ -70,6 +75,11 @@ SOURCE_AUDIT_INTERVAL_SEC = int(os.getenv("SOURCE_AUDIT_INTERVAL_SEC", str(3 * 6
 SOURCE_AUDIT_SAMPLE_BYTES = int(os.getenv("SOURCE_AUDIT_SAMPLE_BYTES", str(256 * 1024)))
 NODE_METRICS_INTERVAL_SEC = int(os.getenv("NODE_METRICS_INTERVAL_SEC", "30"))
 LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
+# Throttle for the [DEBUG] extraction log in entropy_sender_worker (raw
+# sample range/mean/std, Von Neumann efficiency) -- cheap to compute, this
+# just controls log volume. It's what caught the Brzeg omni02 antenna/USB
+# issue (raw samples pinned to 127-128 regardless of gain or frequency).
+EXTRACTION_DEBUG_LOG_INTERVAL_SEC = float(os.getenv("EXTRACTION_DEBUG_LOG_INTERVAL_SEC", "120"))
 SDR_TYPE = os.getenv("SDR_TYPE", "pluto").lower()
 RTL_SDR_INDEX = int(os.getenv("RTL_SDR_INDEX", "0"))
 SAMPLE_RATE = float(os.getenv("SAMPLE_RATE", "3840000"))
@@ -214,6 +224,26 @@ AUTO_TUNE_ENABLED = os.getenv("AUTO_TUNE_ENABLED", "1").lower() in ("1", "true",
 AUTO_TUNE_MARGIN = float(os.getenv("AUTO_TUNE_MARGIN", "0.05"))
 AUTO_TUNE_MIN_WINS = max(1, int(os.getenv("AUTO_TUNE_MIN_WINS", "3")))
 AUTO_TUNE_COOLDOWN_SEC = int(os.getenv("AUTO_TUNE_COOLDOWN_SEC", str(6 * 60 * 60)))
+
+# One-shot exhaustive startup sweep, used only when FREQ=auto (see above).
+# AUTOSCAN_MIN_HZ/AUTOSCAN_MAX_HZ default to a conservative generic range per
+# SDR_TYPE that stays inside common cheap RTL-SDR tuner chips (real hardware
+# varies -- check the tuner name printed at startup, e.g. "Found Fitipower
+# FC0012 tuner", and override these once you know its actual range). Down-
+# converter nodes (CONVERTER_MODE=down) instead default to the RF window(s)
+# implied by CONVERTER_RF_LOW/HIGH_*_HZ, since that's what's actually reachable.
+AUTOSCAN_MIN_HZ = getenv_optional_int("AUTOSCAN_MIN_HZ")
+AUTOSCAN_MAX_HZ = getenv_optional_int("AUTOSCAN_MAX_HZ")
+AUTOSCAN_STEP_HZ = int(os.getenv("AUTOSCAN_STEP_HZ", "500000"))
+AUTOSCAN_SAMPLE_BYTES = int(os.getenv("AUTOSCAN_SAMPLE_BYTES", "32768"))
+AUTOSCAN_SETTLE_SEC = float(os.getenv("AUTOSCAN_SETTLE_SEC", "0.05"))
+AUTOSCAN_MAX_DURATION_SEC = int(os.getenv("AUTOSCAN_MAX_DURATION_SEC", str(20 * 60)))
+
+AUTOSCAN_DEFAULT_RANGES_HZ = {
+    "rtlsdr": (50000000, 900000000),
+    "pluto": (325000000, 3800000000),
+    "dummy": (1000000, 500000000),
+}
 
 # Coarse IARU Region 1 (EU/Africa) amateur allocations, Hz. This is a scan-grid
 # convenience, not a bandplan authority -- adjust/override via SCAN_BANDS to
@@ -706,7 +736,22 @@ def resolve_radio_frequencies(rf_freq_hz=None):
     raise ValueError(f"Unsupported CONVERTER_MODE={CONVERTER_MODE!r}. Use none, down, or up.")
 
 
-RADIO_FREQ_PLAN = resolve_radio_frequencies()
+if AUTOSCAN_ON_START:
+    # Real FREQ is unknown until run_full_spectrum_autoscan() runs against
+    # live hardware in run_sdr_node(). Bring the radio up on a safe,
+    # arbitrary placeholder frequency for now; every field below gets
+    # overwritten once the startup sweep picks a winner.
+    _AUTOSCAN_BRING_UP_HZ = {"pluto": 1000000000, "dummy": 100000000}.get(SDR_TYPE, 100000000)
+    RADIO_FREQ_PLAN = {
+        "mode": "none",
+        "rf_freq_hz": _AUTOSCAN_BRING_UP_HZ,
+        "tuner_freq_hz": _AUTOSCAN_BRING_UP_HZ,
+        "display_freq_hz": _AUTOSCAN_BRING_UP_HZ,
+        "converter_lo_hz": None,
+        "converter_path": "pending-autoscan",
+    }
+else:
+    RADIO_FREQ_PLAN = resolve_radio_frequencies()
 TUNER_FREQ_HZ = RADIO_FREQ_PLAN["tuner_freq_hz"]
 DISPLAY_FREQ_HZ = RADIO_FREQ_PLAN["display_freq_hz"]
 
@@ -1326,6 +1371,7 @@ def entropy_sender_worker(source):
     )
 
     pluto_read_logged = False
+    extraction_debug_state = {"last_log_at": 0.0}
     set_active_sdr_source(source)
     while True:
         read_stage = "idle"
@@ -1382,6 +1428,20 @@ def entropy_sender_worker(source):
             pairs = bits.reshape(-1, 2)
             valid_mask = pairs[:, 0] != pairs[:, 1]
             extracted_bits = pairs[valid_mask, 0]
+
+            _now_ts = time.time()
+            if _now_ts - extraction_debug_state["last_log_at"] >= EXTRACTION_DEBUG_LOG_INTERVAL_SEC:
+                extraction_debug_state["last_log_at"] = _now_ts
+                _ones = int(np.sum(bits)) if bits.size else 0
+                log(
+                    f"[DEBUG] extraction: raw={len(raw_data)}B decimated={decimated.size} "
+                    f"bits={bits.size} ones_ratio={_ones / max(1, bits.size):.4f} "
+                    f"vn_pairs={pairs.shape[0]} vn_kept={extracted_bits.size} "
+                    f"vn_efficiency={extracted_bits.size / max(1, pairs.shape[0]):.4f} "
+                    f"decimated_min={int(decimated.min())} decimated_max={int(decimated.max())} "
+                    f"decimated_mean={float(decimated.mean()):.2f} decimated_std={float(decimated.std()):.2f} "
+                    f"accumulator={len(entropy_accumulator)}B"
+                )
 
             # 5. FIPS 140-3 Health Checks (RCT & APT)
             # RCT: Repetition Count Test (checks for stuck bits / constant output)
@@ -1966,6 +2026,14 @@ def print_node_identity():
     log("[*] Effective SDR node identity:")
     for key in sorted(identity):
         log(f"    {key}={identity[key]}")
+    if AUTOSCAN_ON_START:
+        range_lo, range_hi = resolve_autoscan_range()
+        log(
+            f"[*] Frequency plan: FREQ=auto -- real operating frequency is only "
+            f"decided by run_full_spectrum_autoscan() against live hardware "
+            f"(sweep range {range_lo / 1e6:.1f}-{range_hi / 1e6:.1f} MHz); "
+            f"the values below are just the placeholder bring-up frequency."
+        )
     log(
         "[*] Frequency plan: "
         f"rf={RADIO_FREQ_PLAN['rf_freq_hz']} Hz, "
@@ -2051,24 +2119,148 @@ def handle_manual_scan_signal(signum, frame):
     audit_trigger_event.set()
 
 
+def resolve_autoscan_range():
+    """(min_hz, max_hz) to sweep for FREQ=auto. Explicit AUTOSCAN_MIN_HZ/
+    AUTOSCAN_MAX_HZ always win; otherwise down-converter nodes sweep the RF
+    window(s) their configured LO settings actually reach, and everything
+    else falls back to AUTOSCAN_DEFAULT_RANGES_HZ for the node's SDR_TYPE."""
+    if CONVERTER_MODE == "down":
+        default_lo = min(CONVERTER_RF_LOW_MIN_HZ, CONVERTER_RF_HIGH_MIN_HZ)
+        default_hi = max(CONVERTER_RF_LOW_MAX_HZ, CONVERTER_RF_HIGH_MAX_HZ)
+    else:
+        default_lo, default_hi = AUTOSCAN_DEFAULT_RANGES_HZ.get(SDR_TYPE, (50000000, 900000000))
+
+    range_lo = AUTOSCAN_MIN_HZ if AUTOSCAN_MIN_HZ is not None else default_lo
+    range_hi = AUTOSCAN_MAX_HZ if AUTOSCAN_MAX_HZ is not None else default_hi
+    return range_lo, range_hi
+
+
+def run_full_spectrum_autoscan(source):
+    """One-shot exhaustive sweep run once at startup when FREQ=auto, before
+    any worker thread exists (no tuning_lock contention to worry about yet).
+    Steps across resolve_autoscan_range() at AUTOSCAN_STEP_HZ, scoring each
+    reachable point the same way as the periodic scanner, and leaves the
+    hardware tuned to whichever point scored best. Bounded by
+    AUTOSCAN_MAX_DURATION_SEC so a wide range / fine step can't hang startup
+    indefinitely -- returns the best (freq_hz, repeat_score) found so far
+    when the cap is hit. Returns None if nothing usable was found at all."""
+    range_lo, range_hi = resolve_autoscan_range()
+    step_hz = max(1, AUTOSCAN_STEP_HZ)
+
+    candidates = []
+    freq = range_lo
+    while freq <= range_hi:
+        if rf_frequency_reachable(freq):
+            candidates.append(freq)
+        freq += step_hz
+    total = len(candidates)
+    if total == 0:
+        log(
+            f"[!] AUTOSCAN: no reachable candidates in {range_lo / 1e6:.1f}-"
+            f"{range_hi / 1e6:.1f} MHz (step={step_hz / 1e6:.3f} MHz, "
+            f"CONVERTER_MODE={CONVERTER_MODE!r}). Check AUTOSCAN_MIN_HZ/"
+            "AUTOSCAN_MAX_HZ against your converter/tuner range."
+        )
+        return None
+
+    est_sec = total * (AUTOSCAN_SETTLE_SEC * 2 + 0.05)
+    log(
+        f"[*] AUTOSCAN: sweeping {range_lo / 1e6:.1f}-{range_hi / 1e6:.1f} MHz, "
+        f"{total} points @ {step_hz / 1e6:.3f} MHz step, "
+        f"est. {est_sec / 60:.1f} min (hard cap {AUTOSCAN_MAX_DURATION_SEC / 60:.0f} min)."
+    )
+
+    start_time = time.time()
+    best_freq_hz = None
+    best_score = None
+    scanned = 0
+    progress_every = max(1, total // 20)
+
+    for freq_hz in candidates:
+        if time.time() - start_time > AUTOSCAN_MAX_DURATION_SEC:
+            log(
+                f"[!] AUTOSCAN: hit {AUTOSCAN_MAX_DURATION_SEC}s time cap after "
+                f"{scanned}/{total} points; using the best found so far."
+            )
+            break
+        try:
+            tuner_hz = resolve_radio_frequencies(freq_hz)["tuner_freq_hz"]
+            apply_tuner_frequency(source, tuner_hz)
+            if AUTOSCAN_SETTLE_SEC > 0:
+                time.sleep(AUTOSCAN_SETTLE_SEC)
+            # Discard one read after retuning: the driver/DMA buffer can
+            # still hold samples captured at the previous frequency.
+            read_scan_chunk(source, AUTOSCAN_SAMPLE_BYTES)
+            raw = read_scan_chunk(source, AUTOSCAN_SAMPLE_BYTES)
+            metrics = analyze_raw_signal(raw)
+        except Exception as exc:
+            scanned += 1
+            log(f"[!] AUTOSCAN: probe at {freq_hz} Hz failed: {format_iio_error(exc)}")
+            continue
+
+        scanned += 1
+        if metrics is None:
+            continue
+        score = metrics["repeat_score"]
+        if best_score is None or score < best_score:
+            best_score = score
+            best_freq_hz = freq_hz
+
+        if scanned % progress_every == 0:
+            elapsed = time.time() - start_time
+            log(
+                f"[*] AUTOSCAN progress: {scanned}/{total} points, "
+                f"{elapsed / 60:.1f} min elapsed, best so far "
+                f"{best_freq_hz / 1e6:.3f} MHz repeat_score={best_score:.4f}"
+            )
+
+    if best_freq_hz is None:
+        log("[!] AUTOSCAN: no usable readings across the whole sweep.")
+        return None
+
+    try:
+        final_tuner_hz = resolve_radio_frequencies(best_freq_hz)["tuner_freq_hz"]
+        apply_tuner_frequency(source, final_tuner_hz)
+    except Exception as exc:
+        log(f"[!] AUTOSCAN: failed to land on the winning frequency {best_freq_hz} Hz: {format_iio_error(exc)}")
+        return None
+
+    elapsed = time.time() - start_time
+    log(
+        f"[*] AUTOSCAN complete: best={best_freq_hz / 1e6:.3f} MHz "
+        f"repeat_score={best_score:.4f} ({scanned}/{total} points scanned, "
+        f"{elapsed / 60:.1f} min)."
+    )
+    return best_freq_hz, best_score
+
+
 def run_sdr_node():
+    global FREQ, TUNER_FREQ_HZ, DISPLAY_FREQ_HZ, RADIO_FREQ_PLAN
     signal.signal(signal.SIGUSR1, handle_manual_scan_signal)
     log(
         f"[*] SDR node {NODE_ID} starting. Target: "
         f"{UDP_TARGET_HOST}:{UDP_TARGET_PORT}, Source type: {SDR_TYPE}, "
         f"node_name={NODE_NAME}, receiver_id={RECEIVER_ID or '-'}, host_id={PHYSICAL_HOST_ID}"
     )
-    log(
-        f"[*] Frequency plan: mode={RADIO_FREQ_PLAN['mode']}, "
-        f"path={RADIO_FREQ_PLAN['converter_path']}, "
-        f"rf={RADIO_FREQ_PLAN['rf_freq_hz'] / 1e6:.3f} MHz, "
-        f"tuner={RADIO_FREQ_PLAN['tuner_freq_hz'] / 1e6:.3f} MHz"
-        + (
-            f", lo={RADIO_FREQ_PLAN['converter_lo_hz'] / 1e6:.3f} MHz"
-            if RADIO_FREQ_PLAN["converter_lo_hz"] is not None
-            else ""
+    if AUTOSCAN_ON_START:
+        range_lo, range_hi = resolve_autoscan_range()
+        log(
+            f"[*] Frequency plan: FREQ=auto -- will sweep "
+            f"{range_lo / 1e6:.1f}-{range_hi / 1e6:.1f} MHz once hardware is up "
+            f"and operate on whatever scores best."
         )
-    )
+    else:
+        log(
+            f"[*] Frequency plan: mode={RADIO_FREQ_PLAN['mode']}, "
+            f"path={RADIO_FREQ_PLAN['converter_path']}, "
+            f"rf={RADIO_FREQ_PLAN['rf_freq_hz'] / 1e6:.3f} MHz, "
+            f"tuner={RADIO_FREQ_PLAN['tuner_freq_hz'] / 1e6:.3f} MHz"
+            + (
+                f", lo={RADIO_FREQ_PLAN['converter_lo_hz'] / 1e6:.3f} MHz"
+                if RADIO_FREQ_PLAN["converter_lo_hz"] is not None
+                else ""
+            )
+        )
 
     # Give Pluto a moment to breathe after previous container restart
     if SDR_TYPE == "pluto":
@@ -2097,6 +2289,29 @@ def run_sdr_node():
         if SDR_TYPE == "pluto":
             time.sleep(PLUTO_FAILURE_COOLDOWN_SEC)
         os._exit(1)
+
+    if AUTOSCAN_ON_START:
+        outcome = run_full_spectrum_autoscan(sdr_source)
+        if outcome is None:
+            log(
+                "[!] AUTOSCAN found nothing usable; staying on the placeholder "
+                f"bring-up frequency ({TUNER_FREQ_HZ / 1e6:.3f} MHz) until the "
+                "next manual/periodic scan finds something better."
+            )
+        else:
+            best_freq_hz, best_score = outcome
+            new_plan = resolve_radio_frequencies(best_freq_hz)
+            FREQ = best_freq_hz
+            TUNER_FREQ_HZ = new_plan["tuner_freq_hz"]
+            DISPLAY_FREQ_HZ = new_plan["display_freq_hz"]
+            RADIO_FREQ_PLAN = new_plan
+            log(
+                f"[*] AUTOSCAN: operating frequency resolved to "
+                f"{FREQ / 1e6:.3f} MHz (repeat_score={best_score:.4f}). "
+                f"Frequency plan: mode={RADIO_FREQ_PLAN['mode']}, "
+                f"path={RADIO_FREQ_PLAN['converter_path']}, "
+                f"tuner={RADIO_FREQ_PLAN['tuner_freq_hz'] / 1e6:.3f} MHz"
+            )
 
     # Start workers - pass the initialized source to the sampler thread
     set_active_sdr_source(sdr_source)
