@@ -202,7 +202,8 @@ SCAN_MAX_CANDIDATES = max(1, int(os.getenv("SCAN_MAX_CANDIDATES", "8")))
 SCAN_HARMONIC_MULTIPLES = os.getenv("SCAN_HARMONIC_MULTIPLES", "2,3")
 SCAN_SAMPLE_BYTES = int(os.getenv("SCAN_SAMPLE_BYTES", "65536"))
 SCAN_SETTLE_SEC = float(os.getenv("SCAN_SETTLE_SEC", "0.1"))
-SCAN_GUARD_HZ = int(os.getenv("SCAN_GUARD_HZ", str(int(SAMPLE_RATE))))
+_scan_guard_hz_override = getenv_optional_int("SCAN_GUARD_HZ")
+SCAN_GUARD_HZ = int(SAMPLE_RATE) if _scan_guard_hz_override is None else _scan_guard_hz_override
 
 # Feedback loop: if a scanned candidate keeps beating the current frequency's
 # entropy quality by AUTO_TUNE_MARGIN for AUTO_TUNE_MIN_WINS consecutive scan
