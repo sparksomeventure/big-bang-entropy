@@ -224,6 +224,13 @@ AUTO_TUNE_ENABLED = os.getenv("AUTO_TUNE_ENABLED", "1").lower() in ("1", "true",
 AUTO_TUNE_MARGIN = float(os.getenv("AUTO_TUNE_MARGIN", "0.05"))
 AUTO_TUNE_MIN_WINS = max(1, int(os.getenv("AUTO_TUNE_MIN_WINS", "3")))
 AUTO_TUNE_COOLDOWN_SEC = int(os.getenv("AUTO_TUNE_COOLDOWN_SEC", str(6 * 60 * 60)))
+# Don't even bother chasing a marginally-better candidate when the current
+# frequency is already comfortably healthy -- a candidate only starts
+# counting toward the win streak once the CURRENT repeat_score is at or above
+# this floor. Prevents auto-tune from hopping between two already-fine
+# frequencies over noise-level differences (repeat_score well under this and
+# under the 0.9 reject threshold means "healthy", not "worth optimizing").
+AUTO_TUNE_MIN_CURRENT_SCORE = float(os.getenv("AUTO_TUNE_MIN_CURRENT_SCORE", "0.7"))
 
 # One-shot exhaustive startup sweep, used only when FREQ=auto (see above).
 # AUTOSCAN_MIN_HZ/AUTOSCAN_MAX_HZ default to a conservative generic range per
@@ -1274,8 +1281,12 @@ def run_frequency_scan(source, current_repeat_score: float):
     scan exists for. Tracking by label rather than exact freq_hz absorbs
     adjacent grid points (one SCAN_STEP_HZ apart) trading the "best" rank
     cycle to cycle from measurement noise; the actual retune target is
-    whichever exact frequency won most recently within that label. Without
-    AUTO_TUNE_ENABLED, this only produces a report for a human to act on."""
+    whichever exact frequency won most recently within that label. A win only
+    counts toward the streak when the CURRENT frequency's repeat_score is
+    also at or above AUTO_TUNE_MIN_CURRENT_SCORE, so an already-healthy node
+    doesn't hop between two comparably-fine frequencies over noise-level
+    differences. Without AUTO_TUNE_ENABLED, this only produces a report for a
+    human to act on."""
     global FREQ, TUNER_FREQ_HZ, DISPLAY_FREQ_HZ, RADIO_FREQ_PLAN, last_auto_tune_at
 
     candidates = build_scan_candidates()
@@ -1316,7 +1327,10 @@ def run_frequency_scan(source, current_repeat_score: float):
         # accumulate as long as the SAME general neighborhood keeps winning,
         # and we retune to whichever exact frequency won most recently within
         # it once the streak clears the bar.
-        if best["repeat_score"] <= current_repeat_score - AUTO_TUNE_MARGIN:
+        if (
+            best["repeat_score"] <= current_repeat_score - AUTO_TUNE_MARGIN
+            and current_repeat_score >= AUTO_TUNE_MIN_CURRENT_SCORE
+        ):
             streak_entry = scan_streak.get(best["label"], {"wins": 0, "freq_hz": best["freq_hz"]})
             streak_entry["wins"] += 1
             streak_entry["freq_hz"] = best["freq_hz"]

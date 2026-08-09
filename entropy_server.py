@@ -51,6 +51,16 @@ TELNET_TRUSTED_MAX_BYTES = int(
 STREAM_CHUNK_BYTES = int(os.getenv("STREAM_CHUNK_BYTES", str(64 * 1024)))
 STREAM_WAIT_TIMEOUT_SEC = float(os.getenv("STREAM_WAIT_TIMEOUT_SEC", "2.0"))
 STREAM_WAIT_INTERVAL_SEC = float(os.getenv("STREAM_WAIT_INTERVAL_SEC", "0.05"))
+# Public (untrusted) TCP entropy connections don't get dumped a chunk on connect
+# anymore -- that let any port scanner or bot drain the pool just by opening a
+# socket. Instead they get a short grace window to pipe in an explicit request
+# (e.g. `printf 'GET 65536\n' | nc host 1420`); if nothing arrives in time, an
+# interactive English menu is sent and the entropy pool is only touched once a
+# real GET command comes back.
+TELNET_MENU_GRACE_SEC = float(os.getenv("TELNET_MENU_GRACE_SEC", "0.3"))
+TELNET_MENU_PROMPT_TIMEOUT_SEC = float(os.getenv("TELNET_MENU_PROMPT_TIMEOUT_SEC", "20"))
+TELNET_MENU_MAX_ATTEMPTS = int(os.getenv("TELNET_MENU_MAX_ATTEMPTS", "3"))
+TELNET_MENU_MAX_LINE_BYTES = 128
 POOL_SIZE_MB = int(os.getenv("POOL_SIZE_MB", "128"))
 POOL_MAX_BYTES = POOL_SIZE_MB * 1024 * 1024
 RAW_POOL_SIZE_MB = int(os.getenv("RAW_POOL_SIZE_MB", "64"))
@@ -92,13 +102,19 @@ SOURCE_AUDIT_REPEAT_SCORE_THRESHOLD = float(
 SOURCE_AUDIT_MAX_AGE_SEC = int(
     os.getenv("SOURCE_AUDIT_MAX_AGE_SEC", str(36 * 60 * 60))
 )
+# A node with no contact of ANY kind (audit, metrics, waterfall, samples) for
+# this long is genuinely offline, not just "audit hasn't refreshed yet" --
+# see _node_status_override(). Deliberately shorter than NODE_TTL_SEC (which
+# prunes it from node_stats entirely) so OFFLINE shows up as an early warning
+# well before that.
+OFFLINE_GRACE_SEC = int(os.getenv("OFFLINE_GRACE_SEC", "120"))
 # A node can pass the raw-signal audit (repeat_score under threshold) while
 # still producing zero actual entropy packets -- e.g. a dead antenna feeding
 # a flat DC-ish signal that happens not to look "repetitive". That's not
 # healthy just because the audit says so, so once a node has been around for
 # at least this long, if it has never sent a sample packet (or hasn't sent
 # one in this long), its status is overridden to NO_THROUGHPUT and it's
-# treated as not accepting_samples -- see _no_throughput_override().
+# treated as not accepting_samples -- see _node_status_override().
 NO_THROUGHPUT_GRACE_SEC = int(os.getenv("NO_THROUGHPUT_GRACE_SEC", "120"))
 MIX_BLOCK_BYTES = int(os.getenv("MIX_BLOCK_BYTES", "64"))
 LOG_EVERY_SEC = int(os.getenv("LOG_EVERY_SEC", "30"))
@@ -918,20 +934,37 @@ def _source_audit_summary(audit: Optional[Dict[str, object]], now: Optional[floa
     }
 
 
-def _no_throughput_override(
+def _node_status_override(
     node_stats_state: Optional[Dict[str, object]],
     accepting_samples: bool,
     now: Optional[float] = None,
 ):
-    """A node can pass the raw-signal audit while producing zero actual
-    entropy packets -- e.g. a dead antenna feeding a flat, low-variance
-    signal that doesn't happen to look "repetitive" to repeat_score. Once a
-    node has been around for at least NO_THROUGHPUT_GRACE_SEC, if it has
-    never sent a sample packet (or hasn't sent one in that long), report it
-    as NO_THROUGHPUT / not accepting instead of taking the audit's word for
-    it. Returns (status_override_or_None, accepting_samples, sample_age_sec)."""
+    """Two distinct "the raw audit alone won't tell you this" problems,
+    checked in priority order:
+
+    - OFFLINE: the node hasn't sent ANY message (audit, metrics, waterfall,
+      samples -- anything that touches node_stats) in over
+      OFFLINE_GRACE_SEC. It isn't just quiet on samples, it isn't there.
+      Distinct from a node that's alive and reporting but whose raw audit
+      specifically hasn't refreshed in a while (which just means its
+      SOURCE_AUDIT_INTERVAL_SEC is long, not that anything is wrong).
+
+    - NO_THROUGHPUT: the node is alive and reporting, its raw audit even
+      passes, but it hasn't produced a single accepted sample packet in
+      NO_THROUGHPUT_GRACE_SEC -- e.g. a dead antenna feeding a flat signal
+      that doesn't happen to look "repetitive" to repeat_score.
+
+    Returns (status_override_or_None, accepting_samples, sample_age_sec)."""
     now = time.time() if now is None else now
-    if not accepting_samples or not node_stats_state:
+    if not node_stats_state:
+        return None, accepting_samples, None
+
+    last_seen = node_stats_state.get("last_seen") or 0.0
+    last_seen_age_sec = (now - last_seen) if last_seen else None
+    if last_seen_age_sec is not None and last_seen_age_sec >= OFFLINE_GRACE_SEC:
+        return "OFFLINE", False, None
+
+    if not accepting_samples:
         return None, accepting_samples, None
 
     first_seen = node_stats_state.get("first_seen") or 0.0
@@ -1190,7 +1223,7 @@ def _update_node_stats(node_name: str, raw_bytes: int, payload_bytes: int, rejec
             state["payload_bytes"] += payload_bytes
             state["packets"] += 1
             # Only successfully-accepted packets count as real throughput --
-            # see _no_throughput_override(). Rejected ones already show up
+            # see _node_status_override(). Rejected ones already show up
             # via rejected_packets/health_rejected_packets elsewhere.
             state["last_sample_at"] = time.time()
         state["last_seen"] = time.time()
@@ -1293,10 +1326,10 @@ def _snapshot_sources():
             active_for = max(now - state["first_seen"], 1.0)
             audit_info = audit_snapshot.get(node_name)
             audit_summary = _source_audit_summary(audit_info, now=now)
-            no_throughput_status, accepting_samples, sample_age_sec = _no_throughput_override(
+            status_override, accepting_samples, sample_age_sec = _node_status_override(
                 state, audit_summary["accepting_samples"], now=now
             )
-            source_audit_status = no_throughput_status or audit_summary["status"]
+            source_audit_status = status_override or audit_summary["status"]
             metadata = dict((runtime_snapshot.get(node_name) or {}).get("metadata") or {})
             if audit_info:
                 for key in NODE_METADATA_KEYS:
@@ -1739,6 +1772,185 @@ def udp_receiver_worker():
             _handle_node_metrics(message)
 
 
+# Telnet IAC (RFC 854) command bytes. A plain `telnet host port` client sends
+# option-negotiation sequences unprompted right after connecting even though
+# this isn't a real telnetd -- _recv_telnet_line() transparently discards them
+# instead of treating them as garbage command text.
+_TELNET_IAC = 255
+_TELNET_SB = 250
+_TELNET_SE = 240
+_TELNET_WILL, _TELNET_WONT, _TELNET_DO, _TELNET_DONT = 251, 252, 253, 254
+
+
+def _recv_telnet_line(conn: socket.socket, timeout: float, max_len: int = TELNET_MENU_MAX_LINE_BYTES) -> Optional[str]:
+    """Read one newline-terminated line from conn within `timeout` seconds.
+
+    Returns the decoded, stripped line (no CR/LF, Telnet IAC sequences
+    removed), or None if the deadline passes or the peer disconnects before a
+    full line arrives -- callers treat both cases identically ("no request").
+    """
+    original_timeout = conn.gettimeout()
+    deadline = time.time() + timeout
+    line = bytearray()
+    state = "normal"
+    try:
+        while len(line) < max_len:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            conn.settimeout(remaining)
+            try:
+                chunk = conn.recv(1)
+            except (socket.timeout, TimeoutError):
+                return None
+            if not chunk:
+                return None
+            byte = chunk[0]
+            if state == "normal":
+                if byte == _TELNET_IAC:
+                    state = "iac"
+                elif byte == 10:  # \n
+                    return line.decode("ascii", errors="ignore").strip("\r")
+                elif byte != 13:  # ignore bare \r
+                    line.append(byte)
+            elif state == "iac":
+                if byte == _TELNET_IAC:
+                    line.append(byte)
+                    state = "normal"
+                elif byte == _TELNET_SB:
+                    state = "subneg"
+                elif byte in (_TELNET_WILL, _TELNET_WONT, _TELNET_DO, _TELNET_DONT):
+                    state = "iac_opt"
+                else:
+                    state = "normal"
+            elif state == "iac_opt":
+                state = "normal"
+            elif state == "subneg":
+                if byte == _TELNET_IAC:
+                    state = "subneg_iac"
+            elif state == "subneg_iac":
+                state = "normal" if byte == _TELNET_SE else "subneg"
+        return line.decode("ascii", errors="ignore").strip("\r")
+    finally:
+        conn.settimeout(original_timeout)
+
+
+def _parse_telnet_command(line: str, default_bytes: int, max_bytes: int):
+    """Parse one line of the public TCP entropy menu protocol.
+
+    Returns ("get", n), ("help", None), ("quit", None), or None if the line
+    isn't a recognized command.
+    """
+    text = line.strip()
+    if not text:
+        return ("get", default_bytes)
+
+    upper = text.upper()
+    if upper in ("HELP", "H", "?"):
+        return ("help", None)
+    if upper in ("QUIT", "EXIT", "Q", "BYE"):
+        return ("quit", None)
+
+    parts = text.split()
+    if parts[0].upper() == "GET":
+        if len(parts) == 1:
+            return ("get", default_bytes)
+        if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > 0:
+            return ("get", min(int(parts[1]), max_bytes))
+        return None
+
+    if text.isdigit() and int(text) > 0:
+        return ("get", min(int(text), max_bytes))
+
+    return None
+
+
+def _telnet_menu_banner(default_bytes: int, max_bytes: int) -> bytes:
+    return (
+        "\r\n"
+        "=== Big Bang Entropy :: public TCP entropy service ===\r\n"
+        "This serves a live, physical-noise entropy pool -- not an infinite\r\n"
+        "stream -- so please only request what you actually need.\r\n"
+        "\r\n"
+        "Commands:\r\n"
+        f"  GET [bytes]   fetch entropy (default {default_bytes}, max {max_bytes})\r\n"
+        "  HELP          show this menu again\r\n"
+        "  QUIT          close the connection\r\n"
+        "\r\n"
+        "Tip: scripts can skip this menu by sending a command immediately,\r\n"
+        "e.g. printf 'GET 65536\\n' | nc host 1420 > entropy.bin\r\n"
+        "\r\n"
+        "bbe> "
+    ).encode("ascii")
+
+
+def _negotiate_telnet_request(conn: socket.socket, client_address, session_bytes: int) -> Optional[int]:
+    """Decide how many entropy bytes (if any) to serve an untrusted TCP client.
+
+    A bare connection that never sends a valid request -- a port scanner, a
+    health-check bot, anything that just connects and reads -- must never pop
+    the pool. Only an explicit GET, either piped in immediately by a script or
+    typed interactively after the menu, returns a byte count.
+    """
+    default_bytes = session_bytes
+    max_bytes = session_bytes
+
+    fast_line = _recv_telnet_line(conn, TELNET_MENU_GRACE_SEC)
+    if fast_line is not None:
+        command = _parse_telnet_command(fast_line, default_bytes, max_bytes)
+        if command is None or command[0] != "get":
+            try:
+                conn.sendall(b"ERR unrecognized request, closing.\r\n")
+            except OSError:
+                pass
+            log(f"[*] TCP entropy client {client_address} sent invalid immediate request: {fast_line!r}")
+            return None
+        return command[1]
+
+    try:
+        conn.sendall(_telnet_menu_banner(default_bytes, max_bytes))
+    except OSError:
+        return None
+
+    for _ in range(TELNET_MENU_MAX_ATTEMPTS):
+        line = _recv_telnet_line(conn, TELNET_MENU_PROMPT_TIMEOUT_SEC)
+        if line is None:
+            try:
+                conn.sendall(b"\r\nNo input received, closing connection.\r\n")
+            except OSError:
+                pass
+            return None
+
+        command = _parse_telnet_command(line, default_bytes, max_bytes)
+        if command is None:
+            try:
+                conn.sendall(b"Unrecognized command. Type HELP for options.\r\nbbe> ")
+            except OSError:
+                return None
+            continue
+
+        kind, value = command
+        if kind == "help":
+            try:
+                conn.sendall(_telnet_menu_banner(default_bytes, max_bytes))
+            except OSError:
+                return None
+            continue
+        if kind == "quit":
+            try:
+                conn.sendall(b"Bye.\r\n")
+            except OSError:
+                pass
+            return None
+        return value
+
+    try:
+        conn.sendall(b"Too many invalid attempts, closing connection.\r\n")
+    except OSError:
+        pass
+    return None
+
+
 def telnet_client_worker(conn: socket.socket, address):
     try:
         # Trust must be decided on the real originating client (resolved from the
@@ -1755,15 +1967,21 @@ def telnet_client_worker(conn: socket.socket, address):
         )
 
         if not trusted:
-            data = _pop_entropy_chunk(session_bytes)
+            requested_bytes = _negotiate_telnet_request(conn, client_address, session_bytes)
+            if requested_bytes is None:
+                return
+            data = _pop_entropy_chunk(requested_bytes)
             if data is None:
-                conn.sendall(b"Warming up...\n")
-                log(f"[*] TCP entropy client {client_address} got warmup response")
+                conn.sendall(
+                    b"Warming up, pool does not have that much entropy yet -- "
+                    b"try a smaller GET or reconnect shortly.\r\n"
+                )
+                log(f"[*] TCP entropy client {client_address} got warmup response (requested={requested_bytes})")
                 return
             conn.sendall(data)
             log(
                 f"[*] TCP entropy client {client_address} served {len(data)} bytes "
-                f"(session_limit={session_bytes} trusted={trusted})"
+                f"(requested={requested_bytes} session_limit={session_bytes} trusted={trusted})"
             )
             return
 
@@ -2404,10 +2622,10 @@ def get_node_status(node_name: str):
         stats = dict(node_stats.get(node_name, {}))
         last_seen = stats.get("last_seen", 0.0)
         rejected_packets = stats.get("rejected_packets", 0)
-    no_throughput_status, accepting_samples, sample_age_sec = _no_throughput_override(
+    status_override, accepting_samples, sample_age_sec = _node_status_override(
         stats, summary["accepting_samples"], now=now
     )
-    status = no_throughput_status or summary["status"]
+    status = status_override or summary["status"]
     with node_runtime_stats_lock:
         runtime = node_runtime_stats.get(node_name, {})
         metadata = dict(runtime.get("metadata") or {})
@@ -2441,11 +2659,22 @@ def list_source_audits():
     _cleanup_stale_nodes()
     now = time.time()
     with source_audits_lock:
-        payload = []
-        for node_name, state in sorted(source_audits.items()):
-            item = dict(state)
-            item["age_sec"] = round(now - state["updated_at"], 1) if state.get("updated_at") else None
-            payload.append(item)
+        audit_snapshot = {node_name: dict(state) for node_name, state in source_audits.items()}
+    with node_stats_lock:
+        node_stats_snapshot = {node_name: dict(state) for node_name, state in node_stats.items()}
+
+    payload = []
+    for node_name, state in sorted(audit_snapshot.items()):
+        item = dict(state)
+        item["age_sec"] = round(now - state["updated_at"], 1) if state.get("updated_at") else None
+        status_override, accepting_samples, sample_age_sec = _node_status_override(
+            node_stats_snapshot.get(node_name), item.get("accepting_samples", True), now=now
+        )
+        if status_override:
+            item["status"] = status_override
+            item["accepting_samples"] = accepting_samples
+            item["sample_age_sec"] = sample_age_sec
+        payload.append(item)
     return jsonify(payload)
 
 
