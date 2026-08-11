@@ -1,6 +1,6 @@
-# Big Bang Entropy Open-Source Starter
+# Galactropy Open-Source Starter
 
-This directory contains the files needed to package and run a minimal self-hosted edition of Big Bang Entropy.
+This directory contains the files needed to package and run a minimal self-hosted edition of Galactropy (formerly named Big Bang Entropy).
 
 If you are looking for the full project description, public service details, or broader architecture notes, use the main repository README:
 
