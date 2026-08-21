@@ -3049,7 +3049,11 @@ def get_waterfall(node_name: str, ext: str):
         if image_bytes is None:
             return "Requested format not available for this frame", 404
 
-    return Response(image_bytes, mimetype=f"image/{ext}")
+    return Response(
+        image_bytes,
+        mimetype=f"image/{ext}",
+        headers={"Cache-Control": "public, max-age=5"},
+    )
 
 
 class EntropyRNG:
